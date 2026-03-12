@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	orchestratorName = "amux"
+	orchestratorName = "amux-orchestrator"
 	pollInterval     = 2 * time.Second
 )
 
