@@ -18,8 +18,9 @@ type Project struct {
 
 // Config represents the main configuration
 type Config struct {
-	SidebarWidth int       `yaml:"sidebar_width"`
-	Projects     []Project `yaml:"projects"`
+	SidebarWidth     int       `yaml:"sidebar_width"`
+	SidebarToggleKey string    `yaml:"sidebar_toggle_key"`
+	Projects         []Project `yaml:"projects"`
 }
 
 const (
@@ -64,6 +65,7 @@ func InitConfig() error {
 # Place this file at ~/.config/amux/config.yaml
 
 sidebar_width: 25
+sidebar_toggle_key: S  # Key to toggle sidebar visibility (Prefix + S)
 
 projects:
   - name: project1
@@ -99,6 +101,9 @@ func LoadConfig() (*Config, error) {
 	// Set defaults
 	if cfg.SidebarWidth == 0 {
 		cfg.SidebarWidth = 25
+	}
+	if cfg.SidebarToggleKey == "" {
+		cfg.SidebarToggleKey = "S"
 	}
 
 	// Validate
