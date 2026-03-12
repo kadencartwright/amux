@@ -3,7 +3,6 @@ package tmux
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 )
 
@@ -102,21 +101,11 @@ func ListPanes(session string) (int, error) {
 
 // Attach attaches to a session
 func Attach(session string) error {
-	// Check if we're already in a tmux session
-	if os.Getenv("TMUX") != "" {
-		// Can't attach from within tmux - return a special error
-		return fmt.Errorf("already in tmux session - run 'tmux switch-client -t %s' to switch", session)
-	}
-	// Not in tmux, attach normally
 	cmd := exec.Command("tmux", "attach", "-t", session)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = nil // Suppress stderr to avoid confusing error messages
-	if err := cmd.Run(); err != nil {
-		// If attach fails (e.g., no terminal), return a clearer error
-		return fmt.Errorf("no terminal available - session '%s' is ready. Run 'tmux attach -t %s' from a terminal", session, session)
-	}
-	return nil
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	return cmd.Run()
 }
 
 // Detach detaches from a session
@@ -127,7 +116,7 @@ func Detach() error {
 
 // BindKey binds a key in a session
 func BindKey(session, key, command string) error {
-	cmd := exec.Command("tmux", "bind-key", key, command)
+	cmd := exec.Command("tmux", "bind-key", "-t", session, key, command)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux bind-key: %w (output: %s)", err, string(output))
 	}

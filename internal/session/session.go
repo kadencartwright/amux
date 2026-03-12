@@ -12,8 +12,7 @@ import (
 	"github.com/user/amux/internal/tmux"
 )
 
-const orchestratorName = "amux-orchestrator"
-const agentPrefix = "amux-agent-"
+const orchestratorName = "amux"
 
 // EnsureOrchestrator creates the orchestrator session if it doesn't exist
 func EnsureOrchestrator(cfg *config.Config) error {
@@ -56,7 +55,7 @@ func EnsureOrchestrator(cfg *config.Config) error {
 
 // EnsureAgent creates an agent session for a project if it doesn't exist
 func EnsureAgent(proj config.Project) error {
-	sessionName := agentPrefix + proj.Name
+	sessionName := "agent-" + proj.Name
 
 	if tmux.HasSession(sessionName) {
 		return nil
@@ -101,7 +100,7 @@ func EnsureAgent(proj config.Project) error {
 
 // SwitchTo switches the orchestrator to a project
 func SwitchTo(proj config.Project) error {
-	sessionName := agentPrefix + proj.Name
+	sessionName := "agent-" + proj.Name
 	targetWindow := orchestratorName + ":" + proj.Name
 
 	// Check if window exists
@@ -137,7 +136,7 @@ func SwitchTo(proj config.Project) error {
 func Start() error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		return fmt.Errorf("loading config: %w", err)
+		return err
 	}
 
 	// Ensure status directory exists
@@ -147,7 +146,7 @@ func Start() error {
 
 	// Create orchestrator session
 	if err := EnsureOrchestrator(cfg); err != nil {
-		return fmt.Errorf("ensuring orchestrator: %w", err)
+		return err
 	}
 
 	// Create agent sessions
@@ -163,13 +162,7 @@ func Start() error {
 	}
 
 	// Attach to orchestrator
-	if err := tmux.Attach(orchestratorName); err != nil {
-		// Session is ready but we can't attach from this context
-		fmt.Printf("amux orchestrator started: %s\n", orchestratorName)
-		fmt.Printf("To attach, run: tmux attach -t %s\n", orchestratorName)
-		return nil
-	}
-	return nil
+	return tmux.Attach(orchestratorName)
 }
 
 // Stop detaches from the orchestrator
