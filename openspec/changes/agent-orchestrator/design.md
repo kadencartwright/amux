@@ -59,6 +59,31 @@ This is a new tool, not a modification to existing systems. The agent orchestrat
 
 **Implementation**: Sidebar pane + linked windows. No custom rendering libraries.
 
+### Package Structure
+Standard Go project layout:
+
+```
+amux/
+├── go.mod                    # Module: github.com/user/amux
+├── Makefile                  # Build, test, install targets
+├── README.md                 # Documentation
+├── cmd/amux/
+│   └── main.go              # CLI entry point only
+├── internal/
+│   ├── config/              # Config loading (yaml)
+│   ├── tmux/                # Tmux command wrappers
+│   ├── agents/              # Status detection logic
+│   ├── sidebar/             # Sidebar rendering
+│   └── session/             # Session orchestration
+└── pkg/plugins/opencode/    # Public plugin API
+```
+
+**Rationale**:
+- `internal/` - Implementation details, not exposed
+- `pkg/plugins/` - Public API for opencode integration
+- `cmd/amux/` - Minimal main package (best practice)
+- Clean separation of concerns for testing
+
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
