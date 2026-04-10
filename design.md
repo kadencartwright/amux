@@ -16,6 +16,7 @@ AMUX is rebuilt as a Rust full-stack command center for agentic coding:
 - Web-first UI (no tty-rendered product interface)
 - Persistent daemon runtime
 - Remote access with strong keyboard support (including mobile modifier keys)
+- First-class speech-to-text input for coding agents (device-agnostic clients)
 - Workspace/worktree-first operation model
 - Session-level attention visibility
 
@@ -27,7 +28,7 @@ AMUX is rebuilt as a Rust full-stack command center for agentic coding:
 │ tokio + axum                                          │
 ├───────────────────────────────────────────────────────┤
 │ workspace svc | worktree svc | session svc (tmux)     │
-│ attention svc | auth svc     | event bus              │
+│ attention svc | auth svc | speech svc | event bus     │
 ├───────────────────────────────────────────────────────┤
 │ REST API + WebSocket streams                          │
 └───────────────────────┬───────────────────────────────┘
