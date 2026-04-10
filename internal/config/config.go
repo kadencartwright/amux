@@ -65,7 +65,7 @@ func InitConfig() error {
 # Place this file at ~/.config/amux/config.yaml
 
 sidebar_width: 25
-sidebar_toggle_key: S  # Key to toggle sidebar visibility (Prefix + S)
+sidebar_toggle_key: A  # Key to toggle sidebar visibility (Prefix + A)
 
 projects:
   - name: project1
@@ -103,7 +103,12 @@ func LoadConfig() (*Config, error) {
 		cfg.SidebarWidth = 25
 	}
 	if cfg.SidebarToggleKey == "" {
-		cfg.SidebarToggleKey = "S"
+		cfg.SidebarToggleKey = "A"
+	}
+
+	// Validate toggle key is a single character
+	if len(cfg.SidebarToggleKey) != 1 {
+		return nil, fmt.Errorf("sidebar_toggle_key must be a single character, got: %s", cfg.SidebarToggleKey)
 	}
 
 	// Validate

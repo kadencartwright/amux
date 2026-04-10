@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 
 	"github.com/user/amux/internal/config"
-	"github.com/user/amux/internal/sidebar"
 	"github.com/user/amux/internal/tmux"
 )
 
-const orchestratorName = "amux"
+const (
+	orchestratorName = "amux-orchestrator"
+	agentPrefix      = "amux-agent-"
+)
 
 // EnsureOrchestrator creates the orchestrator session if it doesn't exist
 func EnsureOrchestrator(cfg *config.Config) error {
@@ -37,6 +39,12 @@ func EnsureOrchestrator(cfg *config.Config) error {
 	// Select workspace pane by default
 	tmux.SelectPane(orchestratorName + ":0.1")
 
+	// Launch TUI sidebar in pane 0.0
+	sidebarCmd := fmt.Sprintf("amux-sidebar --config %s", config.GetConfigPath())
+	if err := tmux.SendKeys(orchestratorName+":0.0", sidebarCmd); err != nil {
+		return fmt.Errorf("launching sidebar TUI: %w", err)
+	}
+
 	// Set up key bindings for project switching
 	for i, proj := range cfg.Projects {
 		if i >= 9 {
@@ -50,12 +58,16 @@ func EnsureOrchestrator(cfg *config.Config) error {
 	// Bind 'r' to refresh
 	tmux.BindKey(orchestratorName, "r", "run-shell 'amux refresh'")
 
+	// Bind toggle key for sidebar visibility
+	toggleCmd := fmt.Sprintf("send-keys -t %s:0.0 'F12'", orchestratorName)
+	tmux.BindKey(orchestratorName, cfg.SidebarToggleKey, toggleCmd)
+
 	return nil
 }
 
 // EnsureAgent creates an agent session for a project if it doesn't exist
 func EnsureAgent(proj config.Project) error {
-	sessionName := "agent-" + proj.Name
+	sessionName := agentPrefix + proj.Name
 
 	if tmux.HasSession(sessionName) {
 		return nil
@@ -100,7 +112,7 @@ func EnsureAgent(proj config.Project) error {
 
 // SwitchTo switches the orchestrator to a project
 func SwitchTo(proj config.Project) error {
-	sessionName := "agent-" + proj.Name
+	sessionName := agentPrefix + proj.Name
 	targetWindow := orchestratorName + ":" + proj.Name
 
 	// Check if window exists
@@ -136,7 +148,7 @@ func SwitchTo(proj config.Project) error {
 func Start() error {
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		return err
+		return fmt.Errorf("loading config: %w", err)
 	}
 
 	// Ensure status directory exists
@@ -146,7 +158,7 @@ func Start() error {
 
 	// Create orchestrator session
 	if err := EnsureOrchestrator(cfg); err != nil {
-		return err
+		return fmt.Errorf("ensuring orchestrator: %w", err)
 	}
 
 	// Create agent sessions
@@ -156,13 +168,14 @@ func Start() error {
 		}
 	}
 
-	// Initial sidebar render
-	if err := sidebar.Update(cfg.Projects); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: initial sidebar render failed: %v\n", err)
-	}
-
 	// Attach to orchestrator
-	return tmux.Attach(orchestratorName)
+	if err := tmux.Attach(orchestratorName); err != nil {
+		// Session is ready but we can't attach from this context
+		fmt.Printf("amux orchestrator started: %s\n", orchestratorName)
+		fmt.Printf("To attach, run: tmux attach -t %s\n", orchestratorName)
+		return nil
+	}
+	return nil
 }
 
 // Stop detaches from the orchestrator

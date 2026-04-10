@@ -28,5 +28,5 @@ The current sidebar implementation sends content as keystrokes to a shell, which
 - Replaces `internal/sidebar` package with new TUI-based implementation
 - Adds new `cmd/amux-sidebar` binary for the sidebar TUI program
 - Modifies session orchestration to launch TUI in sidebar pane instead of shell
-- Configuration format extended with new optional field `sidebar_toggle_key` (default: "S")
+- Configuration format extended with new optional field `sidebar_toggle_key` (default: "A")
 - No breaking changes to existing configuration files

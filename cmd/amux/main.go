@@ -6,7 +6,6 @@ import (
 
 	"github.com/user/amux/internal/config"
 	"github.com/user/amux/internal/session"
-	"github.com/user/amux/internal/sidebar"
 )
 
 func main() {
@@ -58,16 +57,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-	case "refresh":
-		cfg, err := config.LoadConfig()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := sidebar.Update(cfg.Projects); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
 	default:
 		showHelp()
 		os.Exit(1)
@@ -83,8 +72,11 @@ func showHelp() {
 	fmt.Println("  init    Create sample configuration file")
 	fmt.Println("  start   Start the orchestrator and attach")
 	fmt.Println("  stop    Detach from orchestrator")
+	fmt.Println("  switch  Switch to a project")
 	fmt.Println()
 	fmt.Println("Key bindings (in amux session):")
 	fmt.Println("  1-9     Switch to project N")
 	fmt.Println("  r       Refresh sidebar")
+	fmt.Println("  q/Esc   Hide sidebar")
+	fmt.Println("  Prefix+S  Toggle sidebar visibility")
 }

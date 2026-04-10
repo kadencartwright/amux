@@ -91,13 +91,13 @@ We need a proper TUI that renders directly to the terminal and communicates with
 - Overlay approach is simpler than resizing tmux panes dynamically
 - `q` or `Esc` hides the sidebar
 - **Important:** We cannot listen for "any key" to wake because the user may be typing in the workspace pane full-screened - we would steal their keystrokes
-- Instead, use a dedicated tmux prefix hotkey that is configurable and defaults to `Prefix + S`
+- Instead, use a dedicated tmux prefix hotkey that is configurable and defaults to `Prefix + A`
 
 **Configuration:**
 ```yaml
 # ~/.config/amux/config.yaml
 sidebar_width: 25
-sidebar_toggle_key: "S"  # Single character, uppercase S by default
+sidebar_toggle_key: "A"  # Single character, uppercase A by default
 
 projects:
   - name: project1
@@ -114,19 +114,19 @@ projects:
   - This ensures workspace keystrokes are never intercepted
 
 **Default Key Choice:**
-- **Default: `S`** (uppercase S)
-- **Why:** Mnemonic for "Sidebar", not used by default tmux (lowercase `s` is `choose-tree`)
+- **Default: `A`** (uppercase A)
+- **Why:** Mnemonic for "AMUX", not used by default tmux
 - **Alternatives user might configure:** `B` (bar), `N` (navigator), `O` (overlay), `T` (toggle)
 
 **Example user flow:**
 ```
 User is working full-screen in workspace
   ↓
-User presses Ctrl+A S (tmux prefix + S, or configured key)
+User presses Ctrl+A A (tmux prefix + A, or configured key)
   ↓
-Tmux sends ANSI escape sequence "\x1b[?25h" to sidebar pane
+Tmux sends F12 key to sidebar pane
   ↓
-Sidebar TUI detects the sequence and toggles visibility
+Sidebar TUI detects F12 and toggles visibility
   ↓
 Sidebar redraws (if was hidden) or clears (if was visible)
   ↓

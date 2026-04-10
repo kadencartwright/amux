@@ -62,6 +62,7 @@ Edit `~/.config/amux/config.yaml`:
 
 ```yaml
 sidebar_width: 25
+sidebar_toggle_key: A  # Key to toggle sidebar visibility (Prefix + A)
 
 projects:
   - name: myproject
@@ -71,6 +72,11 @@ projects:
     path: ~/dotfiles
     agent: claude
 ```
+
+### Configuration Options
+
+- `sidebar_width`: Width of the sidebar pane (default: 25)
+- `sidebar_toggle_key`: Single character key to toggle sidebar visibility with tmux prefix (default: "A")
 
 ## Usage
 
@@ -90,15 +96,23 @@ This will:
 
 When inside the amux session:
 
+**In the sidebar pane:**
 - `1-9` - Switch to project N
 - `r` - Refresh sidebar
+- `q` or `Esc` - Hide sidebar
+
+**Global tmux bindings:**
+- `Prefix + A` (or your configured toggle key) - Toggle sidebar visibility
+
+The sidebar runs as a TUI application and can be hidden to maximize workspace area. When hidden, press your configured toggle key (default: Prefix + A) to show it again.
 
 ### Commands
 
 ```bash
-amux init    # Create sample configuration
-amux start   # Start orchestrator and attach
-amux stop    # Detach from orchestrator
+amux init     # Create sample configuration
+amux start    # Start orchestrator and attach
+amux stop     # Detach from orchestrator
+amux switch   # Switch to a project
 ```
 
 ## Status Indicators
@@ -141,8 +155,9 @@ Status files are stored in `~/.local/share/amux/status/<project>.json`.
 
 - **Single-focus model**: One project active at a time for deep context
 - **Tmux-native**: Uses tmux sessions, panes, and window linking
+- **TUI Sidebar**: Bubble Tea-based sidebar with ANSI colors and keyboard navigation
 - **File-based status**: Simple JSON files for opencode integration
-- **Process monitoring**: Fallback detection for non-opencode agents
+- **Configurable toggle**: Hide/show sidebar with configurable tmux hotkey
 
 ## Development
 
@@ -176,11 +191,16 @@ Install tmux:
 
 Run `amux init` to create a sample configuration.
 
-### Sidebar not updating
+### Sidebar not showing or toggling
 
-Check that the sidebar pane exists:
+Check that the sidebar TUI is running:
 ```bash
-tmux list-panes -t amux
+tmux list-panes -t amux-orchestrator
+```
+
+To manually toggle the sidebar visibility:
+```bash
+tmux send-keys -t amux-orchestrator:0.0 F12
 ```
 
 ### Agent not starting
