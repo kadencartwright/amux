@@ -63,7 +63,17 @@
 Rollback strategy:
 - If event stream introduces instability, keep REST endpoints enabled and temporarily disable WebSocket publication while preserving API behavior.
 
-## Open Questions
+## Locked Decisions
 
-- Should this baseline explicitly specify pagination defaults on `GET /sessions`, or defer until session counts become operationally relevant?
-- Should lifecycle event ordering guarantees be formalized now or in a dedicated event semantics follow-up?
+1. **`GET /sessions` pagination in baseline**
+   - Decision: keep baseline unpaginated for now, but define deterministic ordering by `created_at` descending.
+   - Forward-compatibility rule: future pagination is additive via explicit query params and does not change default ordering semantics.
+   - Rationale: baseline scope stays simple while still giving clients stable, testable list behavior.
+
+2. **Lifecycle event ordering semantics in baseline**
+   - Decision: formalize minimal guarantees now.
+   - Guarantees:
+     - Per session id: lifecycle events are emitted in causal order (`session.created` before `session.terminated`).
+     - Across different sessions: no global total ordering guarantee.
+     - Delivery model: at-least-once; clients must tolerate duplicates via `event_id` de-duplication.
+   - Rationale: this removes ambiguity for client behavior without requiring heavyweight distributed ordering guarantees.

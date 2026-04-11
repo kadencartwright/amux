@@ -211,9 +211,53 @@ This shortlist is for Option C implementation planning (Rust core + custom canva
 
 If this stack fails fidelity tests (IME, wrapping, edge ANSI behavior), next escalation is evaluating `alacritty_terminal` as the state core.
 
-## Open Questions
+## Locked Decisions (Remaining)
 
-- Which Rust terminal parser/state crates become v1 standard?
-- What quality bar defines "phone-usable" interaction for v1?
-- Which cross-browser rendering quirks matter most for launch scope?
-- What explicit performance budget per active session should we enforce?
+### Decision 3: v1 Terminal Core Standard
+
+Adopt the proposed stack as the v1 default:
+
+- Parser: `vte`
+- State model: `vt100`
+- Width/grapheme helpers: `unicode-width`, `unicode-segmentation`
+- Payload transport: `serde`, `serde_json`
+
+Escalation path:
+
+- Promote `alacritty_terminal` only if fidelity acceptance fails for two consecutive milestones on IME composition, wrap behavior, or ANSI edge-sequence fixtures.
+
+### Decision 4: "Phone-Usable" Quality Bar for v1
+
+Define phone-usable as all of the following on iOS Safari and Android Chrome:
+
+- Text entry supports normal typing plus `Ctrl`, `Esc`, `Tab`, arrows, and `Enter` through modifier UX.
+- No terminal corruption or cursor drift during copy/paste and orientation changes.
+- Input reliability at or above 99.9% delivered key events over a 5,000-key scripted run.
+- End-to-end keypress-to-visible-echo latency at p95 <= 160 ms on local/LAN and <= 280 ms on typical remote links.
+
+### Decision 5: Cross-Browser Quirks Priority
+
+Launch-priority browser matrix:
+
+1. iOS Safari (highest risk and mobile-critical)
+2. Android Chrome
+3. Desktop Chromium
+4. Desktop Firefox
+
+Quirk triage order for v1:
+
+- IME composition and virtual keyboard behavior
+- Canvas text metrics and device-pixel-ratio scaling
+- Selection/clipboard interoperability
+- Focus restoration after reconnect and tab switching
+
+### Decision 6: Performance Budget per Active Session
+
+Set explicit v1 budgets per active terminal session:
+
+- Server steady-state overhead: <= 8 MiB RSS per active session target.
+- Server lifecycle overhead: <= 3% single-core CPU at idle for 20 active sessions aggregate.
+- Client rendering: p95 frame time <= 16 ms during sustained output at 60 FPS target.
+- Stream handling: sustain 2,000 cell updates/second per active session without dropped lifecycle events.
+
+These budgets are enforced as milestone acceptance gates; any misses require either optimization work or explicit scope reductions before launch.

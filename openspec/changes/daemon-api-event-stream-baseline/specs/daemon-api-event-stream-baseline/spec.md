@@ -17,6 +17,7 @@ The system SHALL provide REST endpoints to create, list, retrieve, and terminate
 #### Scenario: List sessions
 - **WHEN** a client sends `GET /sessions`
 - **THEN** the system returns known sessions including baseline fields (`id`, `name`, `state`, `created_at`, `last_activity_at`)
+- **AND** the returned list is ordered by `created_at` descending
 
 #### Scenario: Retrieve session by id
 - **WHEN** a client sends `GET /sessions/{session_id}` for an existing active session
@@ -58,6 +59,21 @@ The system SHALL expose a WebSocket endpoint for session lifecycle observation a
 #### Scenario: Emit terminated event
 - **WHEN** a session is terminated through the control plane
 - **THEN** the system emits a `session.terminated` event envelope containing `event_id`, `event_type`, `occurred_at`, and `session_id`
+
+### Requirement: Lifecycle event ordering and delivery semantics
+The system SHALL provide minimal, explicit lifecycle event semantics suitable for baseline client behavior.
+
+#### Scenario: Per-session causal ordering
+- **WHEN** lifecycle events are emitted for the same `session_id`
+- **THEN** `session.created` is emitted before `session.terminated` for that session
+
+#### Scenario: Cross-session ordering
+- **WHEN** lifecycle events are emitted for different session ids
+- **THEN** the system does not guarantee a global total ordering across those sessions
+
+#### Scenario: At-least-once delivery behavior
+- **WHEN** a client consumes lifecycle events from the WebSocket stream
+- **THEN** the client may receive duplicates and can de-duplicate by `event_id`
 
 ### Requirement: Timestamp format baseline
 The system SHALL serialize baseline API and event timestamps as RFC3339 UTC strings.
