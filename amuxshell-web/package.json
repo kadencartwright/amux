@@ -1,0 +1,9 @@
+{
+  "name": "amuxshell-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "test": "node --test ./test/core.test.mjs"
+  }
+}

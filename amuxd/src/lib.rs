@@ -1,3 +1,4 @@
+pub mod shell;
 pub mod terminal;
 
 use std::collections::HashMap;
@@ -589,6 +590,9 @@ impl SessionStore {
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(get_health))
+        .route("/app", get(shell::shell_entry))
+        .route("/app/sessions/:session_id", get(shell::shell_session_entry))
+        .route("/app/assets/*asset", get(shell::shell_asset))
         .route("/sessions", post(create_session).get(list_sessions))
         .route(
             "/sessions/:session_id",
@@ -1272,6 +1276,66 @@ mod tests {
             .expect("terminal req");
         let terminal_resp = app.oneshot(terminal_req).await.expect("terminal resp");
         assert_eq!(terminal_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validate_shell_routes_and_assets_are_served_without_api_regressions() {
+        let temp = tempdir().expect("tempdir");
+        let runtime: Arc<dyn SessionRuntime> = Arc::new(MockRuntime::default());
+        let state = test_state(runtime, temp.path().join("sessions.json"));
+        let app = build_router(state);
+
+        let app_req = Request::builder()
+            .method("GET")
+            .uri("/app")
+            .body(Body::empty())
+            .expect("app req");
+        let app_resp = app.clone().oneshot(app_req).await.expect("app resp");
+        assert_eq!(app_resp.status(), StatusCode::OK);
+        let app_body = app_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let app_html = String::from_utf8(app_body.to_vec()).expect("html");
+        assert!(app_html.contains(r#"<div id="shell-root"></div>"#));
+        assert!(app_html.contains(r#"/app/assets/app.js"#));
+
+        let session_app_req = Request::builder()
+            .method("GET")
+            .uri("/app/sessions/demo-session")
+            .body(Body::empty())
+            .expect("session app req");
+        let session_app_resp = app
+            .clone()
+            .oneshot(session_app_req)
+            .await
+            .expect("session app resp");
+        assert_eq!(session_app_resp.status(), StatusCode::OK);
+
+        let asset_req = Request::builder()
+            .method("GET")
+            .uri("/app/assets/app.css")
+            .body(Body::empty())
+            .expect("asset req");
+        let asset_resp = app.clone().oneshot(asset_req).await.expect("asset resp");
+        assert_eq!(asset_resp.status(), StatusCode::OK);
+        assert_eq!(
+            asset_resp
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/css; charset=utf-8")
+        );
+
+        let api_req = Request::builder()
+            .method("GET")
+            .uri("/sessions")
+            .body(Body::empty())
+            .expect("api req");
+        let api_resp = app.oneshot(api_req).await.expect("api resp");
+        assert_eq!(api_resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

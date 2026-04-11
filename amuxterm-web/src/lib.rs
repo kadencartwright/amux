@@ -654,7 +654,7 @@ pub mod wasm {
             let surface: TerminalSurfaceState = serde_json::from_str(surface_json)
                 .map_err(|err| JsValue::from_str(&err.to_string()))?;
             let report: RenderReport = self.inner.render(&surface);
-            JsValue::from_serde(&report).map_err(|err| JsValue::from_str(&err.to_string()))
+            serde_wasm_bindgen::to_value(&report).map_err(|err| JsValue::from_str(&err.to_string()))
         }
     }
 }
