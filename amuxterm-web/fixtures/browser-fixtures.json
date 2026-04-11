@@ -1,0 +1,28 @@
+{
+  "fixtures": [
+    {
+      "name": "ansi-colors-and-reset",
+      "sequence": "printf '\\u001b[31mred\\u001b[0m default\\n'"
+    },
+    {
+      "name": "wide-char-and-grapheme",
+      "sequence": "printf 'emoji 😀 cafe\\u0301 漢字\\n'"
+    },
+    {
+      "name": "wrapped-output",
+      "sequence": "printf '0123456789012345678901234567890123456789\\n'"
+    },
+    {
+      "name": "cursor-motion",
+      "sequence": "printf 'line1\\nline2\\u001b[Aoverwrite\\n'"
+    },
+    {
+      "name": "alternate-screen",
+      "sequence": "printf '\\u001b[?1049hALT\\u001b[?1049l\\n'"
+    },
+    {
+      "name": "bracketed-paste",
+      "sequence": "printf '\\u001b[?2004hready\\u001b[?2004l\\n'"
+    }
+  ]
+}

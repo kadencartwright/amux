@@ -300,16 +300,12 @@ impl SessionRuntime for TmuxRuntime {
         runtime_name: &str,
         input: &TerminalInputRequest,
     ) -> Result<TerminalInputResponse, AppError> {
+        let mut literal_buffer = String::new();
+
         for event in &input.events {
             match event {
                 TerminalInputEvent::Text { text } | TerminalInputEvent::Paste { text } => {
-                    let output = Command::new("tmux")
-                        .args(["send-keys", "-t", runtime_name, "-l", "--", text])
-                        .output()
-                        .map_err(|e| {
-                            AppError::Runtime(format!("failed to execute tmux send-keys: {e}"))
-                        })?;
-                    ensure_tmux_success("send-keys", output)?;
+                    literal_buffer.push_str(text);
                 }
                 TerminalInputEvent::Key {
                     key,
@@ -317,6 +313,7 @@ impl SessionRuntime for TmuxRuntime {
                     alt,
                     shift: _,
                 } => {
+                    flush_tmux_literal(runtime_name, &mut literal_buffer)?;
                     let keys = tmux_key_sequence(key, *ctrl, *alt)?;
                     for key in keys {
                         let output = Command::new("tmux")
@@ -329,6 +326,7 @@ impl SessionRuntime for TmuxRuntime {
                     }
                 }
                 TerminalInputEvent::Resize { rows, cols } => {
+                    flush_tmux_literal(runtime_name, &mut literal_buffer)?;
                     let output = Command::new("tmux")
                         .args([
                             "resize-window",
@@ -348,10 +346,33 @@ impl SessionRuntime for TmuxRuntime {
             }
         }
 
+        flush_tmux_literal(runtime_name, &mut literal_buffer)?;
+
         Ok(TerminalInputResponse {
             accepted_events: input.events.len(),
         })
     }
+}
+
+fn flush_tmux_literal(runtime_name: &str, literal_buffer: &mut String) -> Result<(), AppError> {
+    if literal_buffer.is_empty() {
+        return Ok(());
+    }
+
+    let output = Command::new("tmux")
+        .args([
+            "send-keys",
+            "-t",
+            runtime_name,
+            "-l",
+            "--",
+            literal_buffer.as_str(),
+        ])
+        .output()
+        .map_err(|e| AppError::Runtime(format!("failed to execute tmux send-keys: {e}")))?;
+    ensure_tmux_success("send-keys", output)?;
+    literal_buffer.clear();
+    Ok(())
 }
 
 fn ensure_tmux_success(command: &str, output: std::process::Output) -> Result<(), AppError> {
