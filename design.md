@@ -18,7 +18,6 @@ AMUX is rebuilt as a Rust full-stack command center for agentic coding:
 - Remote access with strong keyboard support (including mobile modifier keys)
 - First-class speech-to-text input for coding agents (device-agnostic clients)
 - Workspace/worktree-first operation model
-- Session-level attention visibility
 
 ## Architecture Direction
 
@@ -28,7 +27,7 @@ AMUX is rebuilt as a Rust full-stack command center for agentic coding:
 │ tokio + axum                                          │
 ├───────────────────────────────────────────────────────┤
 │ workspace svc | worktree svc | session svc (tmux)     │
-│ attention svc | auth svc | speech svc | event bus     │
+│               | auth svc | speech svc | event bus     │
 ├───────────────────────────────────────────────────────┤
 │ REST API + WebSocket streams                          │
 └───────────────────────┬───────────────────────────────┘
@@ -54,7 +53,7 @@ Adopt Option C for v1:
 
 ### Context
 
-The product requires custom UI composition around terminal sessions, including attention overlays, dashboard elements, and mobile affordances. We need stronger control than an off-the-shelf terminal widget exposes, but still want to stand on mature semantics where possible.
+The product requires custom UI composition around terminal sessions, including  dashboard elements, and mobile affordances. We need stronger control than an off-the-shelf terminal widget exposes, but still want to stand on mature semantics where possible.
 
 ### Alternatives Considered
 
@@ -144,7 +143,6 @@ If triggered, plan migration to direct PTY runtime behind the existing session s
 - M3: Terminal renderer v1 (output correctness, basic input)
 - M4: Workspace/worktree lifecycle support
 - M5: Mobile modifier UX and remote access hardening
-- M6: Attention model and timeline/logbook polish
 
 ## Terminal Crate Shortlist (v0)
 
