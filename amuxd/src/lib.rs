@@ -1,3 +1,5 @@
+pub mod terminal;
+
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -13,11 +15,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use terminal::{
+    TerminalCore, TerminalCursor, TerminalInputEvent, TerminalInputRequest, TerminalInputResponse,
+    TerminalSnapshot, TerminalSurfaceState,
+};
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
+    config: AppConfig,
     runtime: Arc<dyn SessionRuntime>,
     store: Arc<RwLock<SessionStore>>,
     events_tx: broadcast::Sender<LifecycleEvent>,
@@ -25,14 +32,28 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(runtime: Arc<dyn SessionRuntime>, store_path: PathBuf) -> Result<Self, AppError> {
+        Self::new_with_config(runtime, store_path, AppConfig::default())
+    }
+
+    pub fn new_with_config(
+        runtime: Arc<dyn SessionRuntime>,
+        store_path: PathBuf,
+        config: AppConfig,
+    ) -> Result<Self, AppError> {
         let (events_tx, _) = broadcast::channel(1024);
         let store = SessionStore::load(store_path)?;
         Ok(Self {
+            config,
             runtime,
             store: Arc::new(RwLock::new(store)),
             events_tx,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppConfig {
+    pub terminal_renderer_v1_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +98,7 @@ pub struct LifecycleEvent {
 
 #[derive(Debug)]
 pub enum AppError {
+    BadRequest(String),
     NotFound(String),
     Runtime(String),
 }
@@ -84,6 +106,7 @@ pub enum AppError {
 impl Display for AppError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BadRequest(msg) => write!(f, "{msg}"),
             Self::NotFound(msg) => write!(f, "{msg}"),
             Self::Runtime(msg) => write!(f, "{msg}"),
         }
@@ -95,6 +118,16 @@ impl std::error::Error for AppError {}
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorEnvelope {
+                    error: ErrorBody {
+                        code: "invalid_request".to_string(),
+                        message,
+                    },
+                }),
+            )
+                .into_response(),
             Self::NotFound(message) => (
                 StatusCode::NOT_FOUND,
                 Json(ErrorEnvelope {
@@ -125,6 +158,12 @@ pub trait SessionRuntime: Send + Sync {
     fn create(&self, name: Option<&str>) -> Result<RuntimeSession, AppError>;
     fn list(&self) -> Result<Vec<RuntimeSession>, AppError>;
     fn terminate(&self, runtime_name: &str) -> Result<(), AppError>;
+    fn capture_terminal(&self, runtime_name: &str) -> Result<TerminalSnapshot, AppError>;
+    fn send_terminal_input(
+        &self,
+        runtime_name: &str,
+        input: &TerminalInputRequest,
+    ) -> Result<TerminalInputResponse, AppError>;
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +181,11 @@ impl SessionRuntime for TmuxRuntime {
             .filter(|v| !v.trim().is_empty())
             .map(sanitize_runtime_name)
             .unwrap_or_else(|| "session".to_string());
-        let runtime_name = format!("{}-{}", base_name, &Uuid::new_v4().simple().to_string()[..8]);
+        let runtime_name = format!(
+            "{}-{}",
+            base_name,
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
 
         let output = Command::new("tmux")
             .args(["new-session", "-d", "-s", &runtime_name])
@@ -227,6 +270,226 @@ impl SessionRuntime for TmuxRuntime {
 
         Ok(())
     }
+
+    fn capture_terminal(&self, runtime_name: &str) -> Result<TerminalSnapshot, AppError> {
+        let (rows, cols) = tmux_pane_size(runtime_name)?;
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-e", "-p", "-t", runtime_name])
+            .output()
+            .map_err(|e| AppError::Runtime(format!("failed to execute tmux capture-pane: {e}")))?;
+
+        if !output.status.success() {
+            return Err(AppError::Runtime(format!(
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let mut core = TerminalCore::new(rows, cols, 0);
+        core.ingest(&output.stdout);
+        let mut snapshot = core.snapshot();
+        if let Some(cursor) = tmux_cursor(runtime_name)? {
+            snapshot.cursor = cursor;
+        }
+
+        Ok(snapshot)
+    }
+
+    fn send_terminal_input(
+        &self,
+        runtime_name: &str,
+        input: &TerminalInputRequest,
+    ) -> Result<TerminalInputResponse, AppError> {
+        for event in &input.events {
+            match event {
+                TerminalInputEvent::Text { text } | TerminalInputEvent::Paste { text } => {
+                    let output = Command::new("tmux")
+                        .args(["send-keys", "-t", runtime_name, "-l", "--", text])
+                        .output()
+                        .map_err(|e| {
+                            AppError::Runtime(format!("failed to execute tmux send-keys: {e}"))
+                        })?;
+                    ensure_tmux_success("send-keys", output)?;
+                }
+                TerminalInputEvent::Key {
+                    key,
+                    ctrl,
+                    alt,
+                    shift: _,
+                } => {
+                    let keys = tmux_key_sequence(key, *ctrl, *alt)?;
+                    for key in keys {
+                        let output = Command::new("tmux")
+                            .args(["send-keys", "-t", runtime_name, &key])
+                            .output()
+                            .map_err(|e| {
+                                AppError::Runtime(format!("failed to execute tmux send-keys: {e}"))
+                            })?;
+                        ensure_tmux_success("send-keys", output)?;
+                    }
+                }
+                TerminalInputEvent::Resize { rows, cols } => {
+                    let output = Command::new("tmux")
+                        .args([
+                            "resize-window",
+                            "-t",
+                            runtime_name,
+                            "-x",
+                            &cols.to_string(),
+                            "-y",
+                            &rows.to_string(),
+                        ])
+                        .output()
+                        .map_err(|e| {
+                            AppError::Runtime(format!("failed to execute tmux resize-window: {e}"))
+                        })?;
+                    ensure_tmux_success("resize-window", output)?;
+                }
+            }
+        }
+
+        Ok(TerminalInputResponse {
+            accepted_events: input.events.len(),
+        })
+    }
+}
+
+fn ensure_tmux_success(command: &str, output: std::process::Output) -> Result<(), AppError> {
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(AppError::Runtime(format!(
+        "tmux {command} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn tmux_pane_size(runtime_name: &str) -> Result<(u16, u16), AppError> {
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            runtime_name,
+            "#{pane_height}|#{pane_width}",
+        ])
+        .output()
+        .map_err(|e| AppError::Runtime(format!("failed to execute tmux display-message: {e}")))?;
+    ensure_tmux_success("display-message", output.clone())?;
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.trim().split('|');
+    let rows = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| AppError::Runtime("failed parsing tmux pane height".to_string()))?;
+    let cols = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| AppError::Runtime("failed parsing tmux pane width".to_string()))?;
+    Ok((rows, cols))
+}
+
+fn tmux_cursor(runtime_name: &str) -> Result<Option<TerminalCursor>, AppError> {
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            runtime_name,
+            "#{cursor_y}|#{cursor_x}|#{cursor_flag}",
+        ])
+        .output()
+        .map_err(|e| AppError::Runtime(format!("failed to execute tmux display-message: {e}")))?;
+    ensure_tmux_success("display-message", output.clone())?;
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut parts = raw.trim().split('|');
+    let row = match parts.next().and_then(|value| value.parse::<u16>().ok()) {
+        Some(row) => row,
+        None => return Ok(None),
+    };
+    let col = match parts.next().and_then(|value| value.parse::<u16>().ok()) {
+        Some(col) => col,
+        None => return Ok(None),
+    };
+    let visible = parts.next() == Some("1");
+
+    Ok(Some(TerminalCursor { row, col, visible }))
+}
+
+fn tmux_key_sequence(
+    key: &terminal::TerminalKey,
+    ctrl: bool,
+    alt: bool,
+) -> Result<Vec<String>, AppError> {
+    let mut keys = Vec::new();
+
+    if alt {
+        keys.push("Escape".to_string());
+    }
+
+    match key {
+        terminal::TerminalKey::Named { key } => {
+            if ctrl {
+                return match key {
+                    terminal::TerminalNamedKey::ArrowUp => Ok(vec!["C-Up".to_string()]),
+                    terminal::TerminalNamedKey::ArrowDown => Ok(vec!["C-Down".to_string()]),
+                    terminal::TerminalNamedKey::ArrowLeft => Ok(vec!["C-Left".to_string()]),
+                    terminal::TerminalNamedKey::ArrowRight => Ok(vec!["C-Right".to_string()]),
+                    terminal::TerminalNamedKey::Tab => Ok(vec!["C-i".to_string()]),
+                    terminal::TerminalNamedKey::Enter => Ok(vec!["C-m".to_string()]),
+                    terminal::TerminalNamedKey::Escape => Ok(vec!["C-[".to_string()]),
+                    terminal::TerminalNamedKey::Ctrl => Err(AppError::BadRequest(
+                        "bare ctrl key events are not supported; send a ctrl character chord"
+                            .to_string(),
+                    )),
+                };
+            }
+
+            let mapped = match key {
+                terminal::TerminalNamedKey::Ctrl => {
+                    return Err(AppError::BadRequest(
+                        "bare ctrl key events are not supported; send a ctrl character chord"
+                            .to_string(),
+                    ));
+                }
+                terminal::TerminalNamedKey::Escape => "Escape",
+                terminal::TerminalNamedKey::Tab => "Tab",
+                terminal::TerminalNamedKey::ArrowUp => "Up",
+                terminal::TerminalNamedKey::ArrowDown => "Down",
+                terminal::TerminalNamedKey::ArrowLeft => "Left",
+                terminal::TerminalNamedKey::ArrowRight => "Right",
+                terminal::TerminalNamedKey::Enter => "Enter",
+            };
+            keys.push(mapped.to_string());
+        }
+        terminal::TerminalKey::Character { text } => {
+            let mut chars = text.chars();
+            let ch = chars.next().ok_or_else(|| {
+                AppError::BadRequest("character key events require one character".to_string())
+            })?;
+            if chars.next().is_some() {
+                return Err(AppError::BadRequest(
+                    "character key events require exactly one character".to_string(),
+                ));
+            }
+
+            if ctrl {
+                if !ch.is_ascii() {
+                    return Err(AppError::BadRequest(
+                        "ctrl character chords currently require ASCII input".to_string(),
+                    ));
+                }
+                keys.push(format!("C-{}", ch.to_ascii_lowercase()));
+            } else {
+                keys.push(text.clone());
+            }
+        }
+    }
+
+    Ok(keys)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,15 +566,25 @@ impl SessionStore {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(get_health))
         .route("/sessions", post(create_session).get(list_sessions))
         .route(
             "/sessions/:session_id",
             get(get_session).delete(terminate_session),
         )
-        .route("/ws/events", get(ws_events))
-        .with_state(state)
+        .route("/ws/events", get(ws_events));
+
+    if state.config.terminal_renderer_v1_enabled {
+        app = app
+            .route("/sessions/:session_id/terminal", get(get_terminal_surface))
+            .route(
+                "/sessions/:session_id/terminal/input",
+                post(post_terminal_input),
+            );
+    }
+
+    app.with_state(state)
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -365,21 +638,29 @@ async fn list_sessions(State(state): State<AppState>) -> AppResult<Json<Vec<Sess
         .collect();
 
     let store = state.store.read().await;
-    let sessions = store
+    let mut sessions: Vec<_> = store
         .all()
         .into_iter()
         .filter_map(|stored| {
-            runtime_index.get(&stored.runtime_name).map(|runtime| Session {
-                id: stored.id,
-                name: stored.name,
-                state: "running".to_string(),
-                created_at: to_rfc3339_utc(runtime.created_at),
-                last_activity_at: to_rfc3339_utc(runtime.last_activity_at),
+            runtime_index.get(&stored.runtime_name).map(|runtime| {
+                (
+                    runtime.created_at,
+                    Session {
+                        id: stored.id,
+                        name: stored.name,
+                        state: "running".to_string(),
+                        created_at: to_rfc3339_utc(runtime.created_at),
+                        last_activity_at: to_rfc3339_utc(runtime.last_activity_at),
+                    },
+                )
             })
         })
         .collect();
+    sessions.sort_by(|left, right| right.0.cmp(&left.0));
 
-    Ok(Json(sessions))
+    Ok(Json(
+        sessions.into_iter().map(|(_, session)| session).collect(),
+    ))
 }
 
 async fn get_session(
@@ -426,7 +707,9 @@ async fn terminate_session(
     {
         let mut store = state.store.write().await;
         let _ = store.remove(&session_id)?;
-        return Err(AppError::NotFound(format!("session not found: {session_id}")));
+        return Err(AppError::NotFound(format!(
+            "session not found: {session_id}"
+        )));
     }
 
     state.runtime.terminate(&stored.runtime_name)?;
@@ -446,6 +729,27 @@ async fn terminate_session(
 async fn ws_events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     let rx = state.events_tx.subscribe();
     ws.on_upgrade(move |socket| stream_events(socket, rx))
+}
+
+async fn get_terminal_surface(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> AppResult<Json<TerminalSurfaceState>> {
+    let stored = stored_session_by_id(&state, &session_id).await?;
+    let snapshot = state.runtime.capture_terminal(&stored.runtime_name)?;
+    Ok(Json(TerminalSurfaceState::baseline(session_id, snapshot)))
+}
+
+async fn post_terminal_input(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<TerminalInputRequest>,
+) -> AppResult<Json<TerminalInputResponse>> {
+    let stored = stored_session_by_id(&state, &session_id).await?;
+    let response = state
+        .runtime
+        .send_terminal_input(&stored.runtime_name, &payload)?;
+    Ok(Json(response))
 }
 
 async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<LifecycleEvent>) {
@@ -478,6 +782,16 @@ fn sanitize_runtime_name(input: &str) -> String {
     }
 }
 
+async fn stored_session_by_id(
+    state: &AppState,
+    session_id: &str,
+) -> Result<StoredSession, AppError> {
+    let store = state.store.read().await;
+    store
+        .get(session_id)
+        .ok_or_else(|| AppError::NotFound(format!("session not found: {session_id}")))
+}
+
 pub fn default_store_path(data_dir: &Path) -> PathBuf {
     data_dir.join("sessions.json")
 }
@@ -501,6 +815,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use tempfile::tempdir;
+    use terminal::{
+        EscapeSequenceMetrics, TerminalCell, TerminalColor, TerminalKey, TerminalLine,
+        TerminalModes, TerminalNamedKey,
+    };
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tokio_tungstenite::connect_async;
@@ -509,6 +827,8 @@ mod tests {
     #[derive(Default)]
     struct MockRuntime {
         sessions: Mutex<HashMap<String, RuntimeSession>>,
+        snapshots: Mutex<HashMap<String, TerminalSnapshot>>,
+        inputs: Mutex<Vec<TerminalInputRequest>>,
     }
 
     impl SessionRuntime for MockRuntime {
@@ -524,6 +844,10 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .insert(runtime_name, session.clone());
+            self.snapshots
+                .lock()
+                .expect("lock")
+                .insert(session.runtime_name.clone(), sample_snapshot());
             Ok(session)
         }
 
@@ -543,12 +867,137 @@ mod tests {
                 .expect("lock")
                 .remove(runtime_name)
                 .ok_or_else(|| AppError::NotFound("session not found".to_string()))?;
+            self.snapshots.lock().expect("lock").remove(runtime_name);
             Ok(())
+        }
+
+        fn capture_terminal(&self, runtime_name: &str) -> Result<TerminalSnapshot, AppError> {
+            self.snapshots
+                .lock()
+                .expect("lock")
+                .get(runtime_name)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound("session not found".to_string()))
+        }
+
+        fn send_terminal_input(
+            &self,
+            runtime_name: &str,
+            input: &TerminalInputRequest,
+        ) -> Result<TerminalInputResponse, AppError> {
+            if !self
+                .sessions
+                .lock()
+                .expect("lock")
+                .contains_key(runtime_name)
+            {
+                return Err(AppError::NotFound("session not found".to_string()));
+            }
+
+            self.inputs.lock().expect("lock").push(input.clone());
+            Ok(TerminalInputResponse {
+                accepted_events: input.events.len(),
+            })
         }
     }
 
     fn test_state(runtime: Arc<dyn SessionRuntime>, store_path: PathBuf) -> AppState {
         AppState::new(runtime, store_path).expect("state")
+    }
+
+    fn terminal_enabled_state(runtime: Arc<dyn SessionRuntime>, store_path: PathBuf) -> AppState {
+        AppState::new_with_config(
+            runtime,
+            store_path,
+            AppConfig {
+                terminal_renderer_v1_enabled: true,
+            },
+        )
+        .expect("state")
+    }
+
+    fn sample_snapshot() -> TerminalSnapshot {
+        TerminalSnapshot {
+            rows: 2,
+            cols: 4,
+            cursor: TerminalCursor {
+                row: 1,
+                col: 2,
+                visible: true,
+            },
+            modes: TerminalModes {
+                application_cursor: false,
+                application_keypad: false,
+                bracketed_paste: true,
+                alternate_screen: false,
+            },
+            escape_sequence_metrics: EscapeSequenceMetrics {
+                print: 3,
+                execute: 1,
+                csi: 1,
+                esc: 0,
+                osc: 0,
+                dcs: 0,
+            },
+            lines: vec![
+                TerminalLine {
+                    row: 0,
+                    wrapped: false,
+                    cells: vec![
+                        TerminalCell {
+                            column: 0,
+                            text: "a".to_string(),
+                            column_span: 1,
+                            unicode_width: 1,
+                            grapheme_count: 1,
+                            is_wide: false,
+                            is_wide_continuation: false,
+                            foreground: TerminalColor::Default,
+                            background: TerminalColor::Default,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            inverse: false,
+                        },
+                        TerminalCell {
+                            column: 1,
+                            text: "b".to_string(),
+                            column_span: 1,
+                            unicode_width: 1,
+                            grapheme_count: 1,
+                            is_wide: false,
+                            is_wide_continuation: false,
+                            foreground: TerminalColor::Indexed(2),
+                            background: TerminalColor::Default,
+                            bold: true,
+                            italic: false,
+                            underline: false,
+                            inverse: false,
+                        },
+                    ],
+                },
+                TerminalLine {
+                    row: 1,
+                    wrapped: false,
+                    cells: vec![TerminalCell {
+                        column: 0,
+                        text: "😀".to_string(),
+                        column_span: 2,
+                        unicode_width: 2,
+                        grapheme_count: 1,
+                        is_wide: true,
+                        is_wide_continuation: false,
+                        foreground: TerminalColor::Default,
+                        background: TerminalColor::Default,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        inverse: false,
+                    }],
+                },
+            ],
+            plain_text: "ab\n😀".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -566,7 +1015,12 @@ mod tests {
             .expect("create req");
         let create_resp = app.clone().oneshot(create_req).await.expect("create resp");
         assert_eq!(create_resp.status(), StatusCode::OK);
-        let create_body = create_resp.into_body().collect().await.expect("body").to_bytes();
+        let create_body = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         let created: Session = serde_json::from_slice(&create_body).expect("session json");
 
         let list_req = Request::builder()
@@ -603,7 +1057,9 @@ mod tests {
     }
 
     async fn spawn_server(app: Router) -> (SocketAddr, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -682,7 +1138,12 @@ mod tests {
             .body(Body::from(r#"{"name":"gamma"}"#))
             .expect("create req");
         let create_resp = app1.oneshot(create_req).await.expect("create resp");
-        let body = create_resp.into_body().collect().await.expect("body").to_bytes();
+        let body = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         let created: Session = serde_json::from_slice(&body).expect("session json");
 
         let state2 = test_state(runtime, store_path);
@@ -693,9 +1154,220 @@ mod tests {
             .body(Body::empty())
             .expect("list req");
         let list_resp = app2.oneshot(list_req).await.expect("list resp");
-        let list_body = list_resp.into_body().collect().await.expect("body").to_bytes();
+        let list_body = list_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         let sessions: Vec<Session> = serde_json::from_slice(&list_body).expect("sessions json");
 
         assert!(sessions.iter().any(|s| s.id == created.id));
+    }
+
+    #[tokio::test]
+    async fn validate_session_list_is_sorted_descending_by_created_at() {
+        let temp = tempdir().expect("tempdir");
+        let runtime: Arc<dyn SessionRuntime> = Arc::new(MockRuntime::default());
+        let state = test_state(runtime, temp.path().join("sessions.json"));
+        let app = build_router(state);
+
+        let first = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"alpha"}"#))
+            .expect("first req");
+        let first_resp = app.clone().oneshot(first).await.expect("first resp");
+        let first_body = first_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let first_session: Session = serde_json::from_slice(&first_body).expect("session json");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let second = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"beta"}"#))
+            .expect("second req");
+        let second_resp = app.clone().oneshot(second).await.expect("second resp");
+        let second_body = second_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let second_session: Session = serde_json::from_slice(&second_body).expect("session json");
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/sessions")
+            .body(Body::empty())
+            .expect("list req");
+        let list_resp = app.oneshot(list_req).await.expect("list resp");
+        let list_body = list_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let sessions: Vec<Session> = serde_json::from_slice(&list_body).expect("sessions json");
+
+        assert_eq!(sessions[0].id, second_session.id);
+        assert_eq!(sessions[1].id, first_session.id);
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_routes_are_feature_gated() {
+        let temp = tempdir().expect("tempdir");
+        let runtime: Arc<dyn SessionRuntime> = Arc::new(MockRuntime::default());
+        let state = test_state(runtime, temp.path().join("sessions.json"));
+        let app = build_router(state);
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"alpha"}"#))
+            .expect("create req");
+        let create_resp = app.clone().oneshot(create_req).await.expect("create resp");
+        let create_body = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: Session = serde_json::from_slice(&create_body).expect("session json");
+
+        let terminal_req = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions/{}/terminal", created.id))
+            .body(Body::empty())
+            .expect("terminal req");
+        let terminal_resp = app.oneshot(terminal_req).await.expect("terminal resp");
+        assert_eq!(terminal_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_surface_and_input_contract() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let runtime_trait: Arc<dyn SessionRuntime> = runtime.clone();
+        let state = terminal_enabled_state(runtime_trait, temp.path().join("sessions.json"));
+        let app = build_router(state);
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"alpha"}"#))
+            .expect("create req");
+        let create_resp = app.clone().oneshot(create_req).await.expect("create resp");
+        let create_body = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: Session = serde_json::from_slice(&create_body).expect("session json");
+
+        let terminal_req = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions/{}/terminal", created.id))
+            .body(Body::empty())
+            .expect("terminal req");
+        let terminal_resp = app
+            .clone()
+            .oneshot(terminal_req)
+            .await
+            .expect("terminal resp");
+        assert_eq!(terminal_resp.status(), StatusCode::OK);
+        let terminal_body = terminal_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let surface: TerminalSurfaceState =
+            serde_json::from_slice(&terminal_body).expect("surface json");
+
+        assert_eq!(surface.session_id, created.id);
+        assert_eq!(surface.stack.escape_parser, "vte");
+        assert_eq!(surface.stack.state_core, terminal::TerminalStateCore::Vt100);
+        assert_eq!(
+            surface.fallback_policy.alternate_state_core,
+            terminal::TerminalStateCore::AlacrittyTerminal
+        );
+        assert_eq!(
+            surface.input_capabilities.named_keys,
+            vec![
+                TerminalNamedKey::Ctrl,
+                TerminalNamedKey::Escape,
+                TerminalNamedKey::Tab,
+                TerminalNamedKey::ArrowUp,
+                TerminalNamedKey::ArrowDown,
+                TerminalNamedKey::ArrowLeft,
+                TerminalNamedKey::ArrowRight,
+                TerminalNamedKey::Enter,
+            ]
+        );
+        let serialized = serde_json::to_value(&surface).expect("serialize");
+        assert!(serialized.get("runtime_name").is_none());
+        assert!(serialized.get("pane_id").is_none());
+
+        let input_req = Request::builder()
+            .method("POST")
+            .uri(format!("/sessions/{}/terminal/input", created.id))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&TerminalInputRequest {
+                    events: vec![
+                        TerminalInputEvent::Text {
+                            text: "ls".to_string(),
+                        },
+                        TerminalInputEvent::Key {
+                            key: TerminalKey::Named {
+                                key: TerminalNamedKey::Enter,
+                            },
+                            ctrl: false,
+                            alt: false,
+                            shift: false,
+                        },
+                    ],
+                })
+                .expect("json"),
+            ))
+            .expect("input req");
+        let input_resp = app.oneshot(input_req).await.expect("input resp");
+        assert_eq!(input_resp.status(), StatusCode::OK);
+        let input_body = input_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let input_result: TerminalInputResponse =
+            serde_json::from_slice(&input_body).expect("input json");
+        assert_eq!(input_result.accepted_events, 2);
+
+        let recorded_inputs = runtime.inputs.lock().expect("lock");
+        assert_eq!(recorded_inputs.len(), 1);
+        assert_eq!(recorded_inputs[0].events.len(), 2);
+        assert!(matches!(
+            recorded_inputs[0].events[1],
+            TerminalInputEvent::Key {
+                key: TerminalKey::Named {
+                    key: TerminalNamedKey::Enter
+                },
+                ctrl: false,
+                alt: false,
+                shift: false,
+            }
+        ));
     }
 }
