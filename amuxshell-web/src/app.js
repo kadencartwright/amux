@@ -5,18 +5,23 @@ import {
   POLL_INTERVAL_MS,
   acknowledgeInputFocus,
   applySessions,
+  applyWorkspaceResources,
+  applyWorkspaces,
   buildNamedKeyRequest,
   buildTextInputRequest,
   clearCtrlModifier,
+  clearNotice,
   createShellState,
   eventRequiresSessionRefresh,
   handleCreateSuccess,
   parseShellRoute,
   renderShell,
   selectSession,
+  selectWorkspace,
   sessionRoute,
   setInputDraft,
   setMobileNavOpen,
+  setNotice,
   setPageVisibility,
   setSocketStatus,
   setTerminalSurface,
@@ -36,12 +41,20 @@ let socket = null;
 let reconnectTimer = null;
 let terminalRequestId = 0;
 
-root.addEventListener("click", handleClick);
-root.addEventListener("submit", handleSubmit);
+root.addEventListener("click", (event) => {
+  void runAction(() => handleClick(event));
+});
+root.addEventListener("submit", (event) => {
+  void runAction(() => handleSubmit(event));
+});
 root.addEventListener("input", handleInput);
-window.addEventListener("popstate", handlePopState);
+window.addEventListener("popstate", () => {
+  void runAction(handlePopState);
+});
 window.addEventListener("resize", handleResize);
-document.addEventListener("visibilitychange", handleVisibilityChange);
+document.addEventListener("visibilitychange", () => {
+  void runAction(handleVisibilityChange);
+});
 
 boot().catch((error) => {
   console.error("shell boot failed", error);
@@ -60,12 +73,24 @@ async function boot() {
   await initRendererModule(
     new URL("./vendor/amuxterm_web_bg.wasm", import.meta.url)
   );
+  await refetchWorkspaces();
   await refetchSessions({ replaceHistory: true });
   connectSocket(false);
   if (state.selectedSessionId) {
     await refreshTerminal(true);
   }
   updatePolling();
+}
+
+async function runAction(action) {
+  try {
+    state = clearNotice(state);
+    await action();
+  } catch (error) {
+    console.error("shell action failed", error);
+    state = setNotice(state, error.message || String(error), "error");
+    render();
+  }
 }
 
 function render() {
@@ -131,6 +156,13 @@ async function handleClick(event) {
     return;
   }
 
+  if (button.dataset.workspaceSelect) {
+    state = selectWorkspace(state, button.dataset.workspaceSelect);
+    render();
+    await refreshSelectedWorkspaceResources();
+    return;
+  }
+
   if (button.dataset.sessionSelect) {
     state = selectSession(state, button.dataset.sessionSelect);
     navigate(state.route.pathname);
@@ -146,6 +178,26 @@ async function handleClick(event) {
     if (state.selectedSessionId) {
       await refreshTerminal(true);
     }
+    updatePolling();
+    return;
+  }
+
+  if (button.dataset.worktreeSessionCreate) {
+    if (!state.selectedWorkspaceId) {
+      throw new Error("Select a workspace before starting a worktree session.");
+    }
+
+    const created = await apiPost("/sessions", {
+      name: button.dataset.worktreeSessionName || undefined,
+      workspace_id: state.selectedWorkspaceId,
+      kind: "worktree",
+      managed_worktree_id: button.dataset.worktreeSessionCreate
+    });
+    const sessions = await apiGet("/sessions");
+    state = handleCreateSuccess(state, created.id, sessions);
+    navigate(sessionRoute(created.id));
+    render();
+    await refreshTerminal(true);
     updatePolling();
     return;
   }
@@ -172,11 +224,35 @@ async function handleSubmit(event) {
 
   event.preventDefault();
 
-  if (form.id === "create-session-form") {
+  if (form.id === "register-workspace-form") {
+    const formData = new FormData(form);
+    const name = String(formData.get("workspace-name") || "").trim();
+    const rootPath = String(formData.get("workspace-root-path") || "").trim();
+    const created = await apiPost("/workspaces", {
+      name: name || undefined,
+      root_path: rootPath
+    });
+    const workspaces = await apiGet("/workspaces");
+    state = selectWorkspace(applyWorkspaces(state, workspaces), created.id);
+    render();
+    await refreshSelectedWorkspaceResources();
+    state = setNotice(state, `Workspace registered: ${created.name}`, "success");
+    render();
+    form.reset();
+    return;
+  }
+
+  if (form.id === "create-local-session-form") {
+    if (!state.selectedWorkspaceId) {
+      throw new Error("Select a workspace before creating a local session.");
+    }
+
     const formData = new FormData(form);
     const name = String(formData.get("session-name") || "").trim();
     const created = await apiPost("/sessions", {
-      name: name || undefined
+      name: name || undefined,
+      workspace_id: state.selectedWorkspaceId,
+      kind: "local"
     });
     const sessions = await apiGet("/sessions");
     state = handleCreateSuccess(state, created.id, sessions);
@@ -184,6 +260,33 @@ async function handleSubmit(event) {
     render();
     await refreshTerminal(true);
     updatePolling();
+    form.reset();
+    return;
+  }
+
+  if (form.id === "create-worktree-form") {
+    if (!state.selectedWorkspaceId) {
+      throw new Error("Select a workspace before creating a managed worktree.");
+    }
+
+    const formData = new FormData(form);
+    const sourceRef = String(formData.get("worktree-source-ref") || "").trim();
+    const branchName = String(formData.get("worktree-branch-name") || "").trim();
+    const created = await apiPost(
+      `/workspaces/${state.selectedWorkspaceId}/worktrees`,
+      {
+        source_ref: sourceRef,
+        branch_name: branchName
+      }
+    );
+    await refreshSelectedWorkspaceResources();
+    state = setNotice(
+      state,
+      `Managed worktree created: ${created.branch_name}`,
+      "success"
+    );
+    render();
+    form.reset();
     return;
   }
 
@@ -215,7 +318,7 @@ function handleInput(event) {
   state = setInputDraft(state, event.target.value);
 }
 
-function handlePopState() {
+async function handlePopState() {
   state = applySessions(
     {
       ...state,
@@ -227,7 +330,7 @@ function handlePopState() {
   );
   render();
   if (state.selectedSessionId) {
-    refreshTerminal(true);
+    await refreshTerminal(true);
   }
   updatePolling();
 }
@@ -236,13 +339,41 @@ function handleResize() {
   paintTerminal();
 }
 
-function handleVisibilityChange() {
+async function handleVisibilityChange() {
   const wasVisible = state.pageVisible;
   state = setPageVisibility(state, document.visibilityState !== "hidden");
   updatePolling();
   if (!wasVisible && state.pageVisible && state.selectedSessionId) {
-    refreshTerminal(false);
+    await refreshTerminal(false);
   }
+  render();
+}
+
+async function refetchWorkspaces() {
+  const workspaces = await apiGet("/workspaces");
+  state = applyWorkspaces(state, workspaces);
+  render();
+  await refreshSelectedWorkspaceResources();
+}
+
+async function refreshSelectedWorkspaceResources() {
+  if (!state.selectedWorkspaceId) {
+    state = applyWorkspaceResources(state, {
+      managedWorktrees: [],
+      sourceRefs: []
+    });
+    render();
+    return;
+  }
+
+  const [managedWorktrees, sourceRefs] = await Promise.all([
+    apiGet(`/workspaces/${state.selectedWorkspaceId}/worktrees`),
+    apiGet(`/workspaces/${state.selectedWorkspaceId}/source-refs`)
+  ]);
+  state = applyWorkspaceResources(state, {
+    managedWorktrees,
+    sourceRefs
+  });
   render();
 }
 
@@ -277,8 +408,7 @@ async function refreshTerminal(forceRender) {
     }
   } catch (error) {
     if (error.status !== 404) {
-      console.error("terminal refresh failed", error);
-      return;
+      throw error;
     }
 
     const selectedSessionId = state.selectedSessionId;
@@ -307,7 +437,7 @@ function updatePolling() {
   }
 
   pollingTimer = window.setInterval(() => {
-    refreshTerminal(false);
+    void runAction(() => refreshTerminal(false));
   }, POLL_INTERVAL_MS);
 }
 
@@ -331,7 +461,7 @@ function connectSocket(reconnected) {
     state = setSocketStatus(state, "connected");
     render();
     if (shouldRefetchSessionsOnSocketOpen(reconnected)) {
-      await refetchSessions({ replaceHistory: true });
+      await runAction(() => refetchSessions({ replaceHistory: true }));
     }
   });
 
@@ -342,11 +472,13 @@ function connectSocket(reconnected) {
 
     const payload = JSON.parse(message.data);
     if (eventRequiresSessionRefresh(payload)) {
-      await refetchSessions({ replaceHistory: true });
-      if (state.selectedSessionId) {
-        await refreshTerminal(true);
-      }
-      updatePolling();
+      await runAction(async () => {
+        await refetchSessions({ replaceHistory: true });
+        if (state.selectedSessionId) {
+          await refreshTerminal(true);
+        }
+        updatePolling();
+      });
     }
   });
 
@@ -413,7 +545,16 @@ async function apiDelete(pathname) {
 async function apiRequest(pathname, options) {
   const response = await fetch(pathname, options);
   if (!response.ok) {
-    const error = new Error(`${response.status} ${response.statusText}`);
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      const payload = await response.json();
+      if (payload?.error?.message) {
+        message = payload.error.message;
+      }
+    } catch {
+      // Preserve the default HTTP status text fallback.
+    }
+    const error = new Error(message);
     error.status = response.status;
     throw error;
   }

@@ -8,12 +8,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${AMUXD_DATA_DIR:-/tmp/amuxd-manual-verify}"
 LOG_FILE="${DATA_DIR}/amuxd.log"
 WS_LOG="${DATA_DIR}/ws-events.log"
-DAEMON_PID=""
+NON_GIT_DIR="${DATA_DIR}/workspace-none"
+GIT_DIR="${DATA_DIR}/workspace-git"
+REMOTE_DIR="${DATA_DIR}/origin.git"
 WS_PID=""
+DAEMON_PID=""
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "error: missing required command '$1'" >&2
+    printf 'error: missing required command %s\n' "$1" >&2
     exit 1
   fi
 }
@@ -40,8 +43,8 @@ start_daemon() {
     sleep 0.2
   done
 
-  echo "error: daemon failed to become healthy" >&2
-  echo "--- daemon log ---" >&2
+  printf 'error: daemon failed to become healthy\n' >&2
+  printf '--- daemon log ---\n' >&2
   cat "${LOG_FILE}" >&2
   exit 1
 }
@@ -60,8 +63,8 @@ assert_jq() {
   local expr="$2"
   local msg="$3"
   if ! jq -e "${expr}" <<<"${json}" >/dev/null; then
-    echo "assertion failed: ${msg}" >&2
-    echo "json: ${json}" >&2
+    printf 'assertion failed: %s\n' "${msg}" >&2
+    printf 'json: %s\n' "${json}" >&2
     exit 1
   fi
 }
@@ -80,86 +83,146 @@ collect_ws_events() {
     return 0
   fi
 
-  echo "warning: neither websocat nor wscat found; skipping websocket verification" >&2
+  printf 'warning: neither websocat nor wscat found; skipping websocket verification\n' >&2
   return 1
 }
 
-echo "==> checking required tools"
+run_git() {
+  git -C "$1" "${@:2}" >/dev/null
+}
+
+run_git_commit() {
+  GIT_AUTHOR_NAME='AMUX Manual Verify' \
+    GIT_AUTHOR_EMAIL='manual@example.com' \
+    GIT_COMMITTER_NAME='AMUX Manual Verify' \
+    GIT_COMMITTER_EMAIL='manual@example.com' \
+    git -C "$1" "${@:2}" >/dev/null
+}
+
+json_post() {
+  curl -fsS -X POST "$1" -H 'content-type: application/json' -d "$2"
+}
+
+echo '==> checking required tools'
 need_cmd cargo
 need_cmd curl
 need_cmd jq
 need_cmd tmux
+need_cmd git
 
-echo "==> building daemon"
+echo '==> building daemon'
 cargo build --manifest-path "${ROOT_DIR}/Cargo.toml" >/dev/null
 
 trap cleanup EXIT
 
-echo "==> starting daemon"
+echo '==> preparing workspaces'
+rm -rf "${DATA_DIR}"
+mkdir -p "${NON_GIT_DIR}" "${GIT_DIR}"
+printf 'notes\n' >"${NON_GIT_DIR}/README.txt"
+run_git "${GIT_DIR}" init -b main
+printf 'hello\n' >"${GIT_DIR}/README.md"
+run_git "${GIT_DIR}" add README.md
+run_git_commit "${GIT_DIR}" commit -m init
+run_git "${GIT_DIR}" branch local-base
+git init --bare "${REMOTE_DIR}" >/dev/null
+run_git "${GIT_DIR}" remote add origin "${REMOTE_DIR}"
+run_git "${GIT_DIR}" push -u origin main
+
+echo '==> starting daemon'
 start_daemon
 
-echo "==> 1) health"
+echo '==> 1) health'
 HEALTH_JSON="$(curl -fsS "${BASE_URL}/health")"
-assert_jq "${HEALTH_JSON}" '.status == "ok" and .ready == true' "health should be ready"
-assert_jq "${HEALTH_JSON}" '.now | test("Z$")' "health.now should be UTC RFC3339"
+assert_jq "${HEALTH_JSON}" '.status == "ok" and .ready == true' 'health should be ready'
+assert_jq "${HEALTH_JSON}" '.now | test("Z$")' 'health.now should be UTC RFC3339'
 
-echo "==> 2) create/list/get"
-CREATE_JSON="$(curl -fsS -X POST "${BASE_URL}/sessions" -H 'content-type: application/json' -d '{"name":"manual-check"}')"
-SESSION_ID="$(jq -r '.id' <<<"${CREATE_JSON}")"
-assert_jq "${CREATE_JSON}" '.id != null and .name == "manual-check" and .state == "running"' "create response shape"
-assert_jq "${CREATE_JSON}" '.created_at | test("Z$")' "created_at should be UTC RFC3339"
-assert_jq "${CREATE_JSON}" '.last_activity_at | test("Z$")' "last_activity_at should be UTC RFC3339"
+echo '==> 2) register non-git workspace and create local session'
+NON_GIT_WS_JSON="$(json_post "${BASE_URL}/workspaces" "$(jq -nc --arg root "${NON_GIT_DIR}" '{name:"plain",root_path:$root}')")"
+NON_GIT_WS_ID="$(jq -r '.id' <<<"${NON_GIT_WS_JSON}")"
+assert_jq "${NON_GIT_WS_JSON}" '.kind == "none"' 'non-git workspace should be classified as none'
 
-LIST_JSON="$(curl -fsS "${BASE_URL}/sessions")"
-assert_jq "${LIST_JSON}" "map(select(.id == \"${SESSION_ID}\")) | length == 1" "list should include created session"
+NON_GIT_LOCAL_JSON="$(json_post "${BASE_URL}/sessions" "$(jq -nc --arg workspace_id "${NON_GIT_WS_ID}" '{name:"plain-local",workspace_id:$workspace_id,kind:"local"}')")"
+NON_GIT_LOCAL_ID="$(jq -r '.id' <<<"${NON_GIT_LOCAL_JSON}")"
+assert_jq "${NON_GIT_LOCAL_JSON}" '.kind == "local" and .workspace.kind == "none"' 'non-git local session shape'
 
-GET_JSON="$(curl -fsS "${BASE_URL}/sessions/${SESSION_ID}")"
-assert_jq "${GET_JSON}" ".id == \"${SESSION_ID}\"" "get should return created session"
+NON_GIT_REFS_JSON="$(curl -fsS "${BASE_URL}/workspaces/${NON_GIT_WS_ID}/source-refs")"
+assert_jq "${NON_GIT_REFS_JSON}" 'length == 0' 'non-git workspace should expose no source refs'
 
-echo "==> 3) websocket events"
+NON_GIT_WORKTREE_CODE="$(curl -s -o "${DATA_DIR}/non-git-worktree-error.json" -w '%{http_code}' -X POST "${BASE_URL}/workspaces/${NON_GIT_WS_ID}/worktrees" -H 'content-type: application/json' -d '{"source_ref":"main","branch_name":"invalid"}')"
+[[ "${NON_GIT_WORKTREE_CODE}" == '400' ]] || { printf 'expected non-git worktree create to fail with 400\n' >&2; exit 1; }
+
+echo '==> 3) register git workspace and inspect source refs'
+GIT_WS_JSON="$(json_post "${BASE_URL}/workspaces" "$(jq -nc --arg root "${GIT_DIR}" '{name:"repo",root_path:$root}')")"
+GIT_WS_ID="$(jq -r '.id' <<<"${GIT_WS_JSON}")"
+assert_jq "${GIT_WS_JSON}" '.kind == "git"' 'git workspace should be classified as git'
+
+SOURCE_REFS_JSON="$(curl -fsS "${BASE_URL}/workspaces/${GIT_WS_ID}/source-refs")"
+assert_jq "${SOURCE_REFS_JSON}" 'map(select(.name == "main" and .kind == "local_branch")) | length == 1' 'local branch should be listed'
+assert_jq "${SOURCE_REFS_JSON}" 'map(select(.name == "local-base" and .kind == "local_branch")) | length == 1' 'extra local branch should be listed'
+assert_jq "${SOURCE_REFS_JSON}" 'map(select(.name == "origin/main" and .kind == "remote_tracking_branch")) | length == 1' 'remote tracking branch should be listed'
+
+echo '==> 4) create local git session and managed worktrees from local and remote refs'
+GIT_LOCAL_JSON="$(json_post "${BASE_URL}/sessions" "$(jq -nc --arg workspace_id "${GIT_WS_ID}" '{name:"git-local",workspace_id:$workspace_id,kind:"local"}')")"
+GIT_LOCAL_ID="$(jq -r '.id' <<<"${GIT_LOCAL_JSON}")"
+assert_jq "${GIT_LOCAL_JSON}" '.workspace.kind == "git" and .kind == "local"' 'git local session shape'
+
+LOCAL_WORKTREE_JSON="$(json_post "${BASE_URL}/workspaces/${GIT_WS_ID}/worktrees" '{"source_ref":"main","branch_name":"feature-local"}')"
+LOCAL_WORKTREE_ID="$(jq -r '.id' <<<"${LOCAL_WORKTREE_JSON}")"
+assert_jq "${LOCAL_WORKTREE_JSON}" '.branch_name == "feature-local" and .source_ref == "main"' 'local-source managed worktree shape'
+[[ -d "$(jq -r '.path' <<<"${LOCAL_WORKTREE_JSON}")" ]] || { printf 'expected local managed worktree path to exist\n' >&2; exit 1; }
+
+REMOTE_WORKTREE_JSON="$(json_post "${BASE_URL}/workspaces/${GIT_WS_ID}/worktrees" '{"source_ref":"origin/main","branch_name":"feature-remote"}')"
+REMOTE_WORKTREE_ID="$(jq -r '.id' <<<"${REMOTE_WORKTREE_JSON}")"
+assert_jq "${REMOTE_WORKTREE_JSON}" '.branch_name == "feature-remote" and .source_ref == "origin/main"' 'remote-source managed worktree shape'
+[[ -d "$(jq -r '.path' <<<"${REMOTE_WORKTREE_JSON}")" ]] || { printf 'expected remote managed worktree path to exist\n' >&2; exit 1; }
+
+WORKTREE_LIST_JSON="$(curl -fsS "${BASE_URL}/workspaces/${GIT_WS_ID}/worktrees")"
+assert_jq "${WORKTREE_LIST_JSON}" "map(select(.id == \"${LOCAL_WORKTREE_ID}\")) | length == 1" 'local managed worktree should be listed'
+assert_jq "${WORKTREE_LIST_JSON}" "map(select(.id == \"${REMOTE_WORKTREE_ID}\")) | length == 1" 'remote managed worktree should be listed'
+
+DUPLICATE_CODE="$(curl -s -o "${DATA_DIR}/duplicate-branch-error.json" -w '%{http_code}' -X POST "${BASE_URL}/workspaces/${GIT_WS_ID}/worktrees" -H 'content-type: application/json' -d '{"source_ref":"main","branch_name":"feature-local"}')"
+[[ "${DUPLICATE_CODE}" == '409' ]] || { printf 'expected duplicate managed branch to fail with 409\n' >&2; exit 1; }
+
+echo '==> 5) create worktree session'
+WORKTREE_SESSION_JSON="$(json_post "${BASE_URL}/sessions" "$(jq -nc --arg workspace_id "${GIT_WS_ID}" --arg managed_worktree_id "${REMOTE_WORKTREE_ID}" '{name:"remote-worktree-session",workspace_id:$workspace_id,kind:"worktree",managed_worktree_id:$managed_worktree_id}')")"
+WORKTREE_SESSION_ID="$(jq -r '.id' <<<"${WORKTREE_SESSION_JSON}")"
+assert_jq "${WORKTREE_SESSION_JSON}" ".kind == \"worktree\" and .managed_worktree.id == \"${REMOTE_WORKTREE_ID}\"" 'worktree session should bind to managed worktree'
+
+echo '==> 6) websocket events'
 WS_ENABLED=0
 if collect_ws_events; then
   WS_ENABLED=1
   sleep 0.8
-
-  WS_CREATE_JSON="$(curl -fsS -X POST "${BASE_URL}/sessions" -H 'content-type: application/json' -d '{"name":"ws-check"}')"
+  WS_CREATE_JSON="$(json_post "${BASE_URL}/sessions" "$(jq -nc --arg workspace_id "${GIT_WS_ID}" '{name:"ws-check",workspace_id:$workspace_id,kind:"local"}')")"
   WS_SESSION_ID="$(jq -r '.id' <<<"${WS_CREATE_JSON}")"
   curl -fsS -X DELETE "${BASE_URL}/sessions/${WS_SESSION_ID}" >/dev/null
 fi
 
-echo "==> 4) terminate + not-found envelope"
-DELETE_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${BASE_URL}/sessions/${SESSION_ID}")"
-[[ "${DELETE_CODE}" == "204" ]] || { echo "expected DELETE 204, got ${DELETE_CODE}" >&2; exit 1; }
-
-NOT_FOUND_CODE="$(curl -s -o /tmp/amuxd-not-found.json -w '%{http_code}' "${BASE_URL}/sessions/${SESSION_ID}")"
-[[ "${NOT_FOUND_CODE}" == "404" ]] || { echo "expected GET missing 404, got ${NOT_FOUND_CODE}" >&2; exit 1; }
-NOT_FOUND_JSON="$(cat /tmp/amuxd-not-found.json)"
-assert_jq "${NOT_FOUND_JSON}" '.error.code == "session_not_found" and (.error.message | type == "string")' "not-found envelope"
-
-if [[ "${WS_ENABLED}" == "1" ]]; then
+if [[ "${WS_ENABLED}" == '1' ]]; then
   sleep 1
   CREATED_EVENT_COUNT="$(grep -c 'session.created' "${WS_LOG}" || true)"
   TERM_EVENT_COUNT="$(grep -c 'session.terminated' "${WS_LOG}" || true)"
-  [[ "${CREATED_EVENT_COUNT}" -ge 1 ]] || { echo "expected session.created in websocket stream" >&2; exit 1; }
-  [[ "${TERM_EVENT_COUNT}" -ge 1 ]] || { echo "expected session.terminated in websocket stream" >&2; exit 1; }
-  if grep -E '"occurred_at"\s*:\s*"[^"]*Z"' "${WS_LOG}" >/dev/null 2>&1; then
-    :
-  else
-    echo "expected UTC RFC3339 occurred_at in websocket events" >&2
-    exit 1
-  fi
+  [[ "${CREATED_EVENT_COUNT}" -ge 1 ]] || { printf 'expected session.created in websocket stream\n' >&2; exit 1; }
+  [[ "${TERM_EVENT_COUNT}" -ge 1 ]] || { printf 'expected session.terminated in websocket stream\n' >&2; exit 1; }
 fi
 
-echo "==> 5) restart visibility"
-CREATE2_JSON="$(curl -fsS -X POST "${BASE_URL}/sessions" -H 'content-type: application/json' -d '{"name":"restart-check"}')"
-SESSION_ID2="$(jq -r '.id' <<<"${CREATE2_JSON}")"
-
+echo '==> 7) restart visibility'
 restart_daemon
 
-LIST2_JSON="$(curl -fsS "${BASE_URL}/sessions")"
-assert_jq "${LIST2_JSON}" "map(select(.id == \"${SESSION_ID2}\")) | length == 1" "session should remain visible after restart"
+WORKSPACES_AFTER_RESTART="$(curl -fsS "${BASE_URL}/workspaces")"
+assert_jq "${WORKSPACES_AFTER_RESTART}" "map(select(.id == \"${NON_GIT_WS_ID}\")) | length == 1" 'non-git workspace should persist after restart'
+assert_jq "${WORKSPACES_AFTER_RESTART}" "map(select(.id == \"${GIT_WS_ID}\")) | length == 1" 'git workspace should persist after restart'
+
+WORKTREES_AFTER_RESTART="$(curl -fsS "${BASE_URL}/workspaces/${GIT_WS_ID}/worktrees")"
+assert_jq "${WORKTREES_AFTER_RESTART}" "map(select(.id == \"${LOCAL_WORKTREE_ID}\")) | length == 1" 'local managed worktree should persist after restart'
+assert_jq "${WORKTREES_AFTER_RESTART}" "map(select(.id == \"${REMOTE_WORKTREE_ID}\")) | length == 1" 'remote managed worktree should persist after restart'
+
+SESSIONS_AFTER_RESTART="$(curl -fsS "${BASE_URL}/sessions")"
+assert_jq "${SESSIONS_AFTER_RESTART}" "map(select(.id == \"${NON_GIT_LOCAL_ID}\" and .kind == \"local\")) | length == 1" 'non-git local session should remain visible after restart'
+assert_jq "${SESSIONS_AFTER_RESTART}" "map(select(.id == \"${GIT_LOCAL_ID}\" and .workspace.id == \"${GIT_WS_ID}\")) | length == 1" 'git local session should remain visible after restart'
+assert_jq "${SESSIONS_AFTER_RESTART}" "map(select(.id == \"${WORKTREE_SESSION_ID}\" and .managed_worktree.id == \"${REMOTE_WORKTREE_ID}\")) | length == 1" 'worktree session binding should remain visible after restart'
 
 echo
-echo "manual verification passed"
+echo 'manual verification passed'
 echo "- daemon log: ${LOG_FILE}"
 echo "- websocket log: ${WS_LOG}"

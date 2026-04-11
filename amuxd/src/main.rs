@@ -31,7 +31,7 @@ async fn main() {
         .await
         .expect("failed to bind listener");
 
-    println!("amuxd listening on {}", addr);
+    println!("amuxd listening on http://{}", addr);
     axum::serve(listener, app)
         .await
         .expect("server exited unexpectedly");

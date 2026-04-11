@@ -36,7 +36,11 @@ export function createShellState(pathname, visibilityState = "visible") {
   return {
     route: parseShellRoute(pathname),
     sessions: [],
+    workspaces: [],
+    managedWorktrees: [],
+    sourceRefs: [],
     selectedSessionId: null,
+    selectedWorkspaceId: null,
     sessionUnavailable: false,
     terminalUnavailable: false,
     terminalSurface: null,
@@ -45,8 +49,44 @@ export function createShellState(pathname, visibilityState = "visible") {
     socketStatus: "connecting",
     focusTerminalInput: false,
     ctrlModifierLatched: false,
-    inputDraft: ""
+    inputDraft: "",
+    notice: null
   };
+}
+
+export function applyWorkspaces(state, workspaces) {
+  const next = normalizeWorkspaceSelection({
+    ...state,
+    workspaces: [...workspaces]
+  });
+
+  if (next.selectedWorkspaceId !== state.selectedWorkspaceId) {
+    return {
+      ...next,
+      managedWorktrees: [],
+      sourceRefs: []
+    };
+  }
+
+  return next;
+}
+
+export function applyWorkspaceResources(state, { managedWorktrees, sourceRefs }) {
+  return {
+    ...state,
+    managedWorktrees: [...managedWorktrees],
+    sourceRefs: [...sourceRefs]
+  };
+}
+
+export function selectWorkspace(state, workspaceId) {
+  return normalizeWorkspaceSelection({
+    ...state,
+    selectedWorkspaceId: workspaceId,
+    managedWorktrees: [],
+    sourceRefs: [],
+    mobileNavOpen: false
+  });
 }
 
 export function applySessions(state, sessions) {
@@ -159,6 +199,23 @@ export function clearCtrlModifier(state) {
   };
 }
 
+export function setNotice(state, message, tone = "info") {
+  return {
+    ...state,
+    notice: {
+      message,
+      tone
+    }
+  };
+}
+
+export function clearNotice(state) {
+  return {
+    ...state,
+    notice: null
+  };
+}
+
 export function shouldPollTerminal(state) {
   return Boolean(
     state.selectedSessionId && state.pageVisible && !state.terminalUnavailable
@@ -166,7 +223,9 @@ export function shouldPollTerminal(state) {
 }
 
 export function eventRequiresSessionRefresh(event) {
-  return Boolean(event && typeof event.event_type === "string" && event.event_type.startsWith("session."));
+  return Boolean(
+    event && typeof event.event_type === "string" && event.event_type.startsWith("session.")
+  );
 }
 
 export function shouldRefetchSessionsOnSocketOpen(reconnected) {
@@ -244,19 +303,28 @@ export function renderShell(state) {
   const selectedSession = state.sessions.find(
     (session) => session.id === state.selectedSessionId
   );
+  const selectedWorkspace = state.workspaces.find(
+    (workspace) => workspace.id === state.selectedWorkspaceId
+  );
 
-  const sidebar = renderSidebar(state, selectedSession);
-  const banner = state.sessionUnavailable
-    ? `<div class="shell-banner shell-banner--warning">The selected session is no longer available. The shell has been normalized back to <code>/app</code>.</div>`
-    : "";
-
-  const main = renderMainPane(state, selectedSession);
+  const banners = [
+    state.notice
+      ? `<div class="shell-banner shell-banner--${escapeAttribute(state.notice.tone)}">${escapeHtml(
+          state.notice.message
+        )}</div>`
+      : "",
+    state.sessionUnavailable
+      ? `<div class="shell-banner shell-banner--warning">The selected session is no longer available. The shell has been normalized back to <code>/app</code>.</div>`
+      : ""
+  ]
+    .filter(Boolean)
+    .join("");
 
   return `
     <div class="shell ${state.mobileNavOpen ? "shell--nav-open" : ""}">
       <div class="shell__backdrop" data-action="close-mobile-nav"></div>
-      <aside class="shell__sidebar" aria-label="Sessions">
-        ${sidebar}
+      <aside class="shell__sidebar" aria-label="Workspaces and sessions">
+        ${renderSidebar(state, selectedWorkspace, selectedSession)}
       </aside>
       <main class="shell__main">
         <header class="shell__header">
@@ -273,18 +341,45 @@ export function renderShell(state) {
               type="button"
               data-action="open-mobile-nav"
             >
-              Sessions
+              Workspaces
             </button>
           </div>
         </header>
-        ${banner}
-        ${main}
+        ${banners}
+        ${renderMainPane(state, selectedWorkspace, selectedSession)}
       </main>
     </div>
   `;
 }
 
-function renderSidebar(state, selectedSession) {
+function renderSidebar(state, selectedWorkspace, selectedSession) {
+  const workspaceItems = state.workspaces.length
+    ? state.workspaces
+        .map((workspace) => {
+          const selected = workspace.id === state.selectedWorkspaceId;
+          return `
+            <li class="workspace-list__item ${selected ? "workspace-list__item--selected" : ""}">
+              <button
+                type="button"
+                class="workspace-list__select"
+                data-workspace-select="${escapeAttribute(workspace.id)}"
+              >
+                <span class="workspace-list__name">${escapeHtml(workspace.name)}</span>
+                <span class="workspace-list__meta">${escapeHtml(workspace.kind)} · ${escapeHtml(
+                  workspace.root_path
+                )}</span>
+              </button>
+            </li>
+          `;
+        })
+        .join("")
+    : `<li class="workspace-list__empty">Register a workspace to create local or worktree sessions.</li>`;
+
+  const selectedWorkspaceName = selectedWorkspace
+    ? escapeHtml(selectedWorkspace.name)
+    : "Select a workspace";
+  const localSessionDisabled = selectedWorkspace ? "" : "disabled";
+
   const sessionItems = state.sessions.length
     ? state.sessions
         .map((session) => {
@@ -297,6 +392,7 @@ function renderSidebar(state, selectedSession) {
                 data-session-select="${escapeAttribute(session.id)}"
               >
                 <span class="session-list__name">${escapeHtml(session.name)}</span>
+                <span class="session-list__meta">${escapeHtml(sessionContextLabel(session))}</span>
                 <span class="session-list__meta">${escapeHtml(relativeTimestamp(session.created_at))}</span>
               </button>
               <button
@@ -311,48 +407,94 @@ function renderSidebar(state, selectedSession) {
           `;
         })
         .join("")
-    : `<li class="session-list__empty">No sessions yet. Create one to start the shell loop.</li>`;
+    : `<li class="session-list__empty">No sessions yet. Create a local session or launch one from a managed worktree.</li>`;
 
   return `
     <div class="shell__sidebar-header">
       <div>
-        <p class="shell__eyebrow">Single-session control rail</p>
-        <h2>Sessions</h2>
+        <p class="shell__eyebrow">Workspace-scoped shell rail</p>
+        <h2>Workspaces</h2>
       </div>
       <button
         class="shell__sidebar-close"
         type="button"
         data-action="close-mobile-nav"
-        aria-label="Close session drawer"
+        aria-label="Close shell drawer"
       >
         Close
       </button>
     </div>
-    <form id="create-session-form" class="session-create-form">
-      <label class="session-create-form__label" for="session-name">New session</label>
+    <form id="register-workspace-form" class="session-create-form workspace-register-form">
+      <label class="session-create-form__label" for="workspace-root-path">Register workspace</label>
+      <input
+        id="workspace-root-path"
+        name="workspace-root-path"
+        type="text"
+        placeholder="/path/to/workspace"
+        autocomplete="off"
+      />
+      <input
+        name="workspace-name"
+        type="text"
+        placeholder="optional display name"
+        autocomplete="off"
+      />
+      <button type="submit">Add workspace</button>
+    </form>
+    <ul class="workspace-list" data-testid="workspace-list">${workspaceItems}</ul>
+    <form id="create-local-session-form" class="session-create-form">
+      <label class="session-create-form__label" for="session-name">Local session</label>
+      <p class="session-create-form__hint">${selectedWorkspaceName}</p>
       <input
         id="session-name"
         name="session-name"
         type="text"
         placeholder="session name"
         autocomplete="off"
+        ${localSessionDisabled}
       />
-      <button type="submit">Create session</button>
+      <button type="submit" ${localSessionDisabled}>Create local session</button>
     </form>
+    <div class="shell__sidebar-header shell__sidebar-header--sessions">
+      <div>
+        <p class="shell__eyebrow">Runtime sessions</p>
+        <h2>Sessions</h2>
+      </div>
+    </div>
     <ul class="session-list">${sessionItems}</ul>
   `;
 }
 
-function renderMainPane(state, selectedSession) {
-  if (!selectedSession) {
+function renderMainPane(state, selectedWorkspace, selectedSession) {
+  return `
+    <div class="shell-stack">
+      ${selectedSession ? renderTerminalPane(state, selectedSession) : renderEmptyState(selectedWorkspace)}
+      ${renderWorkspacePanel(state, selectedWorkspace)}
+    </div>
+  `;
+}
+
+function renderEmptyState(selectedWorkspace) {
+  if (selectedWorkspace) {
     return `
       <section class="shell-empty">
         <p class="shell-empty__title">No active session selected</p>
-        <p>Select a session from the rail or create a new one to start polling terminal state.</p>
+        <p>Create a local session for <strong>${escapeHtml(
+          selectedWorkspace.name
+        )}</strong> or launch one from a managed worktree.</p>
       </section>
     `;
   }
 
+  return `
+    <section class="shell-empty">
+      <p class="shell-empty__title">No workspace selected</p>
+      <p>Register a workspace from the rail to unlock local sessions, source-ref discovery, and managed worktrees.</p>
+    </section>
+  `;
+}
+
+function renderTerminalPane(state, selectedSession) {
   const unavailable = state.terminalUnavailable
     ? `<div class="terminal-unavailable">
          <p class="terminal-unavailable__title">Terminal surface unavailable</p>
@@ -394,11 +536,108 @@ function renderMainPane(state, selectedSession) {
         <div>
           <p class="shell__eyebrow">Selected session</p>
           <h2>${escapeHtml(selectedSession.name)}</h2>
+          <p class="terminal-shell__context">${escapeHtml(sessionContextLabel(selectedSession))}</p>
         </div>
         <p class="terminal-shell__meta" data-role="terminal-meta">${escapeHtml(terminalMeta)}</p>
       </div>
       ${unavailable}
       ${inputControls}
+    </section>
+  `;
+}
+
+function renderWorkspacePanel(state, selectedWorkspace) {
+  if (!selectedWorkspace) {
+    return `
+      <section class="workspace-panel shell-empty">
+        <p class="shell-empty__title">Workspace control plane</p>
+        <p>Once you register a workspace, this panel will show source refs, managed worktrees, and worktree session launch controls.</p>
+      </section>
+    `;
+  }
+
+  const worktreeItems = state.managedWorktrees.length
+    ? state.managedWorktrees
+        .map((worktree) => {
+          return `
+            <li class="worktree-list__item">
+              <div>
+                <p class="worktree-list__branch">${escapeHtml(worktree.branch_name)}</p>
+                <p class="worktree-list__meta">Base ${escapeHtml(worktree.source_ref)}</p>
+                <p class="worktree-list__meta">${escapeHtml(worktree.path)}</p>
+              </div>
+              <button
+                type="button"
+                class="worktree-list__launch"
+                data-worktree-session-create="${escapeAttribute(worktree.id)}"
+                data-worktree-session-name="${escapeAttribute(worktree.branch_name)}"
+              >
+                Start session
+              </button>
+            </li>
+          `;
+        })
+        .join("")
+    : `<li class="worktree-list__empty">No managed worktrees yet.</li>`;
+
+  const sourceRefOptions = state.sourceRefs.length
+    ? state.sourceRefs
+        .map((sourceRef) => {
+          return `<option value="${escapeAttribute(sourceRef.name)}">${escapeHtml(
+            sourceRef.name
+          )} (${escapeHtml(sourceRef.kind)})</option>`;
+        })
+        .join("")
+    : `<option value="">No source refs available</option>`;
+
+  const worktreeCreateForm =
+    selectedWorkspace.kind === "git"
+      ? `
+        <form id="create-worktree-form" class="session-create-form workspace-worktree-form">
+          <label class="session-create-form__label" for="worktree-source-ref">Create managed worktree</label>
+          <select
+            id="worktree-source-ref"
+            name="worktree-source-ref"
+            ${state.sourceRefs.length ? "" : "disabled"}
+          >
+            ${sourceRefOptions}
+          </select>
+          <input
+            name="worktree-branch-name"
+            type="text"
+            placeholder="new branch name"
+            autocomplete="off"
+          />
+          <button type="submit" ${state.sourceRefs.length ? "" : "disabled"}>Create managed worktree</button>
+        </form>
+      `
+      : `
+        <div class="workspace-panel__note">
+          <p class="workspace-panel__note-title">Managed worktrees unavailable</p>
+          <p>This workspace is classified as <code>none</code>, so only local sessions are supported.</p>
+        </div>
+      `;
+
+  return `
+    <section class="workspace-panel" data-testid="workspace-panel">
+      <div class="workspace-panel__header">
+        <div>
+          <p class="shell__eyebrow">Selected workspace</p>
+          <h2>${escapeHtml(selectedWorkspace.name)}</h2>
+        </div>
+        <div class="workspace-panel__meta">
+          <span class="workspace-panel__pill">${escapeHtml(selectedWorkspace.kind)}</span>
+          <code>${escapeHtml(selectedWorkspace.root_path)}</code>
+        </div>
+      </div>
+      ${worktreeCreateForm}
+      <div class="workspace-panel__section">
+        <div class="workspace-panel__section-header">
+          <h3>Managed worktrees</h3>
+          <span class="workspace-panel__section-meta">${escapeHtml(String(state.managedWorktrees.length))} tracked</span>
+        </div>
+        <ul class="worktree-list" data-testid="managed-worktree-list">${worktreeItems}</ul>
+      </div>
     </section>
   `;
 }
@@ -452,6 +691,35 @@ function normalizeSelection(state) {
     selectedSessionId: found.id,
     sessionUnavailable: false
   };
+}
+
+function normalizeWorkspaceSelection(state) {
+  if (!state.workspaces.length) {
+    return {
+      ...state,
+      selectedWorkspaceId: null,
+      managedWorktrees: [],
+      sourceRefs: []
+    };
+  }
+
+  if (state.workspaces.some((workspace) => workspace.id === state.selectedWorkspaceId)) {
+    return state;
+  }
+
+  return {
+    ...state,
+    selectedWorkspaceId: state.workspaces[0].id
+  };
+}
+
+function sessionContextLabel(session) {
+  const workspaceName = session.workspace?.name || "workspace";
+  if (session.kind === "worktree" && session.managed_worktree) {
+    return `${workspaceName} · worktree:${session.managed_worktree.branch_name}`;
+  }
+
+  return `${workspaceName} · local`;
 }
 
 function normalizePath(pathname) {

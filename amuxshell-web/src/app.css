@@ -36,6 +36,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -144,6 +145,18 @@ textarea {
   color: var(--shell-warning);
 }
 
+.shell-banner--success {
+  border-color: rgba(126, 240, 195, 0.35);
+  background: rgba(126, 240, 195, 0.1);
+  color: var(--shell-accent);
+}
+
+.shell-banner--error {
+  border-color: rgba(255, 139, 139, 0.4);
+  background: rgba(255, 139, 139, 0.12);
+  color: #ffd4d4;
+}
+
 .shell__sidebar-header {
   display: flex;
   justify-content: space-between;
@@ -161,7 +174,13 @@ textarea {
   color: var(--shell-text-muted);
 }
 
+.session-create-form__hint {
+  margin: -0.25rem 0 0;
+  color: var(--shell-text-muted);
+}
+
 .session-create-form input,
+.session-create-form select,
 .terminal-input textarea {
   width: 100%;
   padding: 0.85rem 1rem;
@@ -195,6 +214,15 @@ textarea {
   list-style: none;
 }
 
+.workspace-list,
+.worktree-list {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
 .session-list__item {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -212,7 +240,23 @@ textarea {
   cursor: pointer;
 }
 
+.workspace-list__select,
+.worktree-list__launch {
+  border: 1px solid transparent;
+  background: rgba(8, 19, 31, 0.72);
+  color: inherit;
+  border-radius: 1rem;
+  padding: 0.9rem 1rem;
+  text-align: left;
+  cursor: pointer;
+}
+
 .session-list__item--selected .session-list__select {
+  border-color: rgba(126, 240, 195, 0.5);
+  background: rgba(18, 47, 58, 0.7);
+}
+
+.workspace-list__item--selected .workspace-list__select {
   border-color: rgba(126, 240, 195, 0.5);
   background: rgba(18, 47, 58, 0.7);
 }
@@ -222,10 +266,22 @@ textarea {
   display: block;
 }
 
+.workspace-list__name,
+.workspace-list__meta {
+  display: block;
+}
+
 .session-list__meta,
 .session-list__empty,
 .terminal-input__hint,
 .terminal-shell__meta {
+  color: var(--shell-text-muted);
+}
+
+.workspace-list__meta,
+.workspace-list__empty,
+.worktree-list__meta,
+.terminal-shell__context {
   color: var(--shell-text-muted);
 }
 
@@ -240,6 +296,11 @@ textarea {
   display: grid;
   gap: 1rem;
   padding: 1.25rem;
+}
+
+.shell-stack {
+  display: grid;
+  gap: 1.25rem;
 }
 
 .terminal-shell__header {
@@ -316,6 +377,75 @@ textarea {
   padding: 2rem;
 }
 
+.workspace-panel {
+  display: grid;
+  gap: 1rem;
+  padding: 1.25rem;
+  background: var(--shell-bg-elevated);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius);
+  box-shadow: var(--shell-shadow);
+}
+
+.workspace-panel__header,
+.workspace-panel__section-header,
+.worktree-list__item {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.workspace-panel__meta {
+  display: grid;
+  justify-items: end;
+  gap: 0.5rem;
+  color: var(--shell-text-muted);
+}
+
+.workspace-panel__pill {
+  border-radius: 999px;
+  border: 1px solid var(--shell-border);
+  padding: 0.35rem 0.7rem;
+  text-transform: capitalize;
+}
+
+.workspace-panel__section h3,
+.workspace-panel__header h2,
+.workspace-panel__note-title,
+.worktree-list__branch {
+  margin: 0.2rem 0 0;
+}
+
+.workspace-panel__section-meta {
+  color: var(--shell-text-muted);
+}
+
+.workspace-panel__note {
+  padding: 1rem 1.25rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(173, 207, 222, 0.16);
+  background: rgba(8, 19, 31, 0.72);
+}
+
+.worktree-list__item {
+  padding: 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(173, 207, 222, 0.12);
+  background: rgba(8, 19, 31, 0.72);
+}
+
+.worktree-list__empty {
+  color: var(--shell-text-muted);
+}
+
+.worktree-list__launch {
+  min-width: 9rem;
+  text-align: center;
+  background: rgba(126, 240, 195, 0.14);
+  border-color: rgba(126, 240, 195, 0.28);
+}
+
 .shell--fatal {
   display: block;
 }
@@ -370,7 +500,8 @@ code {
   .shell__header,
   .terminal-shell,
   .shell-empty,
-  .session-create-form {
+  .session-create-form,
+  .workspace-panel {
     border-radius: 1.25rem;
   }
 
@@ -396,6 +527,16 @@ code {
 
   .terminal-shell__header {
     flex-direction: column;
+  }
+
+  .workspace-panel__header,
+  .workspace-panel__section-header,
+  .worktree-list__item {
+    flex-direction: column;
+  }
+
+  .workspace-panel__meta {
+    justify-items: start;
   }
 
   .terminal-modifiers {
