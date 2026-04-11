@@ -287,7 +287,8 @@ impl SessionRuntime for TmuxRuntime {
         }
 
         let mut core = TerminalCore::new(rows, cols, 0);
-        core.ingest(&output.stdout);
+        let normalized = normalize_tmux_capture_stream(&output.stdout);
+        core.ingest(&normalized);
         let mut snapshot = core.snapshot();
         if let Some(cursor) = tmux_cursor(runtime_name)? {
             snapshot.cursor = cursor;
@@ -385,6 +386,21 @@ fn ensure_tmux_success(command: &str, output: std::process::Output) -> Result<()
         "tmux {command} failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     )))
+}
+
+fn normalize_tmux_capture_stream(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    let mut previous = None;
+
+    for byte in bytes {
+        if *byte == b'\n' && previous != Some(b'\r') {
+            normalized.push(b'\r');
+        }
+        normalized.push(*byte);
+        previous = Some(*byte);
+    }
+
+    normalized
 }
 
 fn tmux_pane_size(runtime_name: &str) -> Result<(u16, u16), AppError> {
@@ -1023,6 +1039,15 @@ mod tests {
             ],
             plain_text: "ab\n😀".to_string(),
         }
+    }
+
+    #[test]
+    fn tmux_capture_normalization_inserts_carriage_returns_before_linefeeds() {
+        let normalized = normalize_tmux_capture_stream(b"prompt 1\nprompt 2\n");
+        assert_eq!(normalized, b"prompt 1\r\nprompt 2\r\n");
+
+        let already_normalized = normalize_tmux_capture_stream(b"prompt 1\r\nprompt 2\r\n");
+        assert_eq!(already_normalized, b"prompt 1\r\nprompt 2\r\n");
     }
 
     #[tokio::test]

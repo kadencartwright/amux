@@ -552,8 +552,14 @@ pub mod wasm {
     impl super::CanvasPainter for WebCanvasPainter {
         fn begin_frame(&mut self, width_px: f32, height_px: f32) {
             if let Some(canvas) = self.context.canvas() {
-                canvas.set_width(width_px.ceil() as u32);
-                canvas.set_height(height_px.ceil() as u32);
+                let width = width_px.ceil() as u32;
+                let height = height_px.ceil() as u32;
+                if canvas.width() != width || canvas.height() != height {
+                    canvas.set_width(width);
+                    canvas.set_height(height);
+                    self.context.set_font("14px monospace");
+                    self.context.set_text_baseline("alphabetic");
+                }
             }
         }
 
