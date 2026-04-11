@@ -147,6 +147,9 @@ pub struct RenderReport {
     pub layout_epoch: u64,
 }
 
+const DEFAULT_FOREGROUND_COLOR: &str = "#e5e7eb";
+const DEFAULT_BACKGROUND_COLOR: &str = "#282c34";
+
 pub trait CanvasPainter {
     fn begin_frame(&mut self, width_px: f32, height_px: f32);
     fn clear(&mut self);
@@ -534,6 +537,52 @@ fn mutate_surface(surface: &mut TerminalSurfaceState, frame: usize, updates_per_
     }
 }
 
+fn resolve_web_cell_colors(cell: &TerminalCell) -> (String, String) {
+    let mut foreground = web_color(&cell.foreground, false);
+    let mut background = web_color(&cell.background, true);
+
+    if cell.inverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+
+    (foreground, background)
+}
+
+fn web_color(color: &TerminalColor, background: bool) -> String {
+    match color {
+        TerminalColor::Default => {
+            if background {
+                DEFAULT_BACKGROUND_COLOR.to_string()
+            } else {
+                DEFAULT_FOREGROUND_COLOR.to_string()
+            }
+        }
+        TerminalColor::Indexed(idx) => indexed_web_color(*idx).to_string(),
+        TerminalColor::Rgb([r, g, b]) => format!("rgb({r}, {g}, {b})"),
+    }
+}
+
+fn indexed_web_color(index: u8) -> &'static str {
+    match index {
+        0 => "#1f2430",
+        1 => "#ff6b6b",
+        2 => "#98c379",
+        3 => "#e5c07b",
+        4 => "#61afef",
+        5 => "#c678dd",
+        6 => "#56b6c2",
+        7 => "#dcdfe4",
+        8 => "#5c6370",
+        9 => "#ff7b72",
+        10 => "#b8e994",
+        11 => "#f4d35e",
+        12 => "#7cc7ff",
+        13 => "#d2a8ff",
+        14 => "#7ee7f2",
+        _ => "#f8fafc",
+    }
+}
+
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm {
     use wasm_bindgen::JsCast;
@@ -542,7 +591,7 @@ pub mod wasm {
 
     use super::{
         CellMetrics, Orientation, RenderReport, TerminalCanvasRenderer, TerminalCell,
-        TerminalColor, TerminalSurfaceState,
+        TerminalSurfaceState, resolve_web_cell_colors,
     };
 
     struct WebCanvasPainter {
@@ -575,7 +624,7 @@ pub mod wasm {
         }
 
         fn draw_cell(&mut self, x_px: f32, y_px: f32, metrics: CellMetrics, cell: &TerminalCell) {
-            let bg = css_color(&cell.background);
+            let (fg, bg) = resolve_web_cell_colors(cell);
             self.context.set_fill_style_str(&bg);
             self.context.fill_rect(
                 f64::from(x_px),
@@ -588,7 +637,6 @@ pub mod wasm {
                 return;
             }
 
-            let fg = css_color(&cell.foreground);
             self.context.set_fill_style_str(&fg);
             let _ = self.context.fill_text(
                 &cell.text,
@@ -598,23 +646,6 @@ pub mod wasm {
         }
 
         fn finish_frame(&mut self) {}
-    }
-
-    fn css_color(color: &TerminalColor) -> String {
-        match color {
-            TerminalColor::Default => "#d0d0d0".to_string(),
-            TerminalColor::Indexed(idx) => match idx {
-                0 => "#000000".to_string(),
-                1 => "#ff5f56".to_string(),
-                2 => "#27c93f".to_string(),
-                3 => "#ffbd2e".to_string(),
-                4 => "#1f6feb".to_string(),
-                5 => "#d63384".to_string(),
-                6 => "#17a2b8".to_string(),
-                _ => "#f8f8f2".to_string(),
-            },
-            TerminalColor::Rgb([r, g, b]) => format!("rgb({r}, {g}, {b})"),
-        }
     }
 
     #[wasm_bindgen]
@@ -748,5 +779,41 @@ mod tests {
         assert_eq!(summary.frames, 30);
         assert_eq!(summary.updates_per_frame, 100);
         assert!(summary.p95_frame_time_ms >= 0.0);
+    }
+
+    #[test]
+    fn default_web_palette_uses_dark_background_and_light_foreground() {
+        let cell = TerminalCell {
+            column: 0,
+            text: "x".to_string(),
+            foreground: TerminalColor::Default,
+            background: TerminalColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        };
+
+        let (foreground, background) = resolve_web_cell_colors(&cell);
+        assert_eq!(foreground, DEFAULT_FOREGROUND_COLOR);
+        assert_eq!(background, DEFAULT_BACKGROUND_COLOR);
+    }
+
+    #[test]
+    fn inverse_web_palette_swaps_foreground_and_background() {
+        let cell = TerminalCell {
+            column: 0,
+            text: "x".to_string(),
+            foreground: TerminalColor::Indexed(2),
+            background: TerminalColor::Indexed(4),
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: true,
+        };
+
+        let (foreground, background) = resolve_web_cell_colors(&cell);
+        assert_eq!(foreground, indexed_web_color(4));
+        assert_eq!(background, indexed_web_color(2));
     }
 }
