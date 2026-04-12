@@ -34,19 +34,19 @@ The system SHALL provide modifier buttons for Ctrl, Esc, Tab, arrow keys, and En
 
 ### Requirement: Text input area
 
-The system SHALL provide a text input area for typing terminal commands on mobile.
+The system SHALL provide a hidden or visually minimal text input area for mobile virtual keyboard access.
 
 #### Scenario: Text input receives virtual keyboard
 
-- **WHEN** the user taps on the text input area
+- **WHEN** the user taps on the mobile keyboard area
 - **THEN** the mobile virtual keyboard appears
-- **AND** typed characters are captured in the input area
+- **AND** typed characters are captured through the mobile input area
 
-#### Scenario: Submit sends to terminal
+#### Scenario: Typed input forwards immediately
 
-- **WHEN** the user types text and presses Enter (or taps Send)
-- **THEN** the text is sent to the terminal
-- **AND** the input area is cleared
+- **WHEN** the user types or pastes text through the mobile input area
+- **THEN** the system forwards the resulting bytes to the terminal immediately without waiting for a submit action
+- **AND** the mobile input area is cleared or normalized as needed for the next edit event
 
 ### Requirement: Desktop direct keyboard capture
 
@@ -79,3 +79,28 @@ The system SHALL support latched modifiers for mobile input.
 - **WHEN** a latched modifier has been applied to a character
 - **THEN** the modifier is cleared
 - **AND** subsequent characters are sent without the modifier
+
+### Requirement: Mobile orientation and paste remain coherent
+
+The system SHALL preserve coherent terminal interaction across orientation changes and paste actions on supported mobile browsers.
+
+#### Scenario: Orientation change preserves terminal interaction
+
+- **WHEN** a mobile user rotates the device during an active terminal session
+- **THEN** terminal output remains coherent
+- **AND** the mobile input area remains usable after the resize/orientation change
+
+#### Scenario: Paste preserves terminal input order
+
+- **WHEN** a mobile user pastes text into the mobile input area
+- **THEN** the pasted bytes are forwarded to the terminal in the intended order
+- **AND** the terminal state does not become corrupted by duplicate or reordered mobile input handling
+
+### Requirement: Mobile input reliability threshold
+
+The system SHALL meet an explicit reliability threshold for the required mobile key set.
+
+#### Scenario: Scripted mobile reliability run
+
+- **WHEN** a 5,000-key scripted input run is executed on iOS Safari or Android Chrome across text entry, modifiers, arrows, and Enter
+- **THEN** at least 99.9% of intended key events are delivered to the terminal session

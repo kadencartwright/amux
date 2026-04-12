@@ -1,69 +1,113 @@
-## REMOVED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Full terminal snapshot bootstrap and resync endpoint
 
-**Reason**: Replaced by ghostty-terminal-stream. Client bootstraps from initial PTY output after resize.
+The system SHALL continue to expose `GET /sessions/{session_id}/terminal` as the authoritative full terminal state endpoint for bootstrap and resync, even after live rendering moves to `ghostty-web`.
 
-### Requirement: Session-scoped read-only terminal stream
+#### Scenario: Initial terminal bootstrap
 
-**Reason**: Replaced by bidirectional WebSocket in ghostty-terminal-stream. Input and output use the same connection.
+- **WHEN** a client requests `GET /sessions/{session_id}/terminal` for an existing session before opening that session's terminal stream
+- **THEN** the system returns the current terminal state for that session
+- **AND** the returned state includes the visible surface plus scrollback needed for client bootstrap
 
-### Requirement: Row-level diff frames with monotonic sequencing
+#### Scenario: Resync after reconnect or inactivity
 
-**Reason**: Replaced by raw PTY byte streaming. No JSON snapshots or diffs.
+- **WHEN** a client needs to recover after reconnect or browser visibility restoration
+- **THEN** the system uses `GET /sessions/{session_id}/terminal` as the full resync source for that session
 
-### Requirement: Full resync on reconnect, sequence gap, or visibility restore
+### Requirement: Session-scoped terminal stream
 
-**Reason**: Client reconnects and re-establishes dimensions. tmux preserves shell state server-side.
+The system SHALL expose a bidirectional WebSocket endpoint at `GET /sessions/{session_id}/terminal/stream` for live terminal input and output for one selected session.
 
-### Requirement: No resume-from-sequence in v1
+#### Scenario: Connect selected-session stream
 
-**Reason**: No sequence numbers in raw byte streaming.
+- **WHEN** a client connects to `GET /sessions/{session_id}/terminal/stream` for an existing session and the protocol upgrades to WebSocket
+- **THEN** the system establishes a live terminal stream for that session only
 
-### Requirement: Backpressure favors fresher terminal state
+#### Scenario: Reject unknown terminal stream session
 
-**Reason**: Client (ghostty-web) handles backpressure internally.
+- **WHEN** a client requests `GET /sessions/{session_id}/terminal/stream` for an unknown or unavailable session
+- **THEN** the system does not establish a terminal stream for that session
 
-### Requirement: Terminal input remains a separate API
+### Requirement: Raw byte stream uses binary frames
 
-**Reason**: Replaced by bidirectional WebSocket. Input flows over the same connection as output.
-
-## ADDED Requirements
-
-### Requirement: Raw PTY byte streaming
-
-The system SHALL stream raw PTY bytes to the client over the WebSocket connection without serialization.
+The system SHALL send PTY output in WebSocket binary frames and SHALL accept terminal input bytes in WebSocket binary frames.
 
 #### Scenario: Output streamed as raw bytes
 
 - **WHEN** the PTY produces output for the session
-- **THEN** the system sends the raw bytes as WebSocket TEXT messages
-- **AND** no JSON or structured format wraps the data
+- **THEN** the system sends the raw bytes as WebSocket binary frames
+- **AND** no JSON or UTF-8 text conversion wraps the data
 
-### Requirement: Bidirectional WebSocket channel
-
-The system SHALL use a single WebSocket connection for both terminal input and output.
-
-#### Scenario: Input over same WebSocket
+#### Scenario: Input uses same WebSocket
 
 - **WHEN** the client sends terminal input over the WebSocket
 - **THEN** the system forwards the raw bytes to the PTY
-- **AND** no separate HTTP endpoint is required for input
+- **AND** no separate HTTP endpoint is required for the primary input path
 
-### Requirement: Resize via WebSocket message
+### Requirement: Control messages stay separate from terminal bytes
 
-The system SHALL accept resize commands as WebSocket messages in the format `SIZE:{rows}:{cols}`.
+The system SHALL reserve WebSocket text frames for explicit control messages such as resize.
 
-#### Scenario: Resize message processed
+#### Scenario: Resize uses structured control frame
 
-- **WHEN** the client sends "SIZE:24:80"
-- **THEN** the system resizes the PTY to 24 rows and 80 columns
+- **WHEN** the client needs to resize the terminal
+- **THEN** the client sends a WebSocket text frame containing a structured control message
+- **AND** terminal byte traffic remains in binary frames only
 
-### Requirement: Connection lifecycle
+### Requirement: Full resync on reconnect or visibility restore
 
-The system SHALL close the WebSocket when the session terminates.
+The system SHALL require clients to perform a full snapshot resync instead of incremental continuation whenever the selected-session stream reconnects or browser visibility is restored after inactivity.
 
-#### Scenario: Session termination closes connection
+#### Scenario: Reconnect requires full reload
 
-- **WHEN** the session is terminated
-- **THEN** the WebSocket connection is closed
+- **WHEN** a client reconnects `GET /sessions/{session_id}/terminal/stream` after interruption
+- **THEN** the client must reacquire `GET /sessions/{session_id}/terminal` before treating new live bytes as authoritative
+
+#### Scenario: Visibility restore requires full reload
+
+- **WHEN** the client restores browser visibility for a selected session after the terminal view was inactive
+- **THEN** the client must reacquire `GET /sessions/{session_id}/terminal` before continuing live rendering
+
+### Requirement: Backpressure favors bounded buffering and recoverable reconnect
+
+The system SHALL tolerate slow consumers with bounded buffering and forced reconnect rather than unbounded accumulation of stale terminal bytes.
+
+#### Scenario: Slow consumer exceeds byte budget
+
+- **WHEN** terminal output changes faster than a connected client can consume pending bytes
+- **THEN** the system may close that client's terminal stream once a bounded byte budget is exceeded
+- **AND** the client recovers by refetching `GET /sessions/{session_id}/terminal` and reconnecting the live stream
+
+### Requirement: Stream closes when selected session terminates
+
+The system SHALL close the selected-session terminal stream when that session terminates or otherwise becomes unavailable.
+
+#### Scenario: Session termination closes terminal stream
+
+- **WHEN** the selected session is terminated while a client is connected to `GET /sessions/{session_id}/terminal/stream`
+- **THEN** the system closes that session's terminal stream
+
+### Requirement: Remote auth and exposure stay outside the daemon
+
+The system SHALL keep terminal-stream authentication and public remote exposure concerns outside `amuxd`, behind a separate gateway or equivalent fronting layer.
+
+#### Scenario: Terminal stream uses gateway-owned remote security boundary
+
+- **WHEN** AMUX is exposed beyond the local daemon boundary
+- **THEN** authentication and remote exposure controls are enforced outside `amuxd`
+- **AND** the terminal stream capability does not require daemon-owned remote auth behavior in v1
+
+## REMOVED Requirements
+
+### Requirement: Row-level diff frames with monotonic sequencing
+
+**Reason**: Replaced by raw PTY byte streaming; the stream no longer carries row-diff payloads or sequence numbers.
+
+### Requirement: No resume-from-sequence in v1
+
+**Reason**: Resume-from-sequence is not applicable once live updates are transmitted as a raw byte stream.
+
+### Requirement: Terminal input remains a separate API
+
+**Reason**: Primary terminal input now flows over the same bidirectional WebSocket as live terminal output.

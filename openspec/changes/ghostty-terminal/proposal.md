@@ -6,28 +6,30 @@ Additionally, the current architecture requires maintaining a complex Rust WASM 
 
 ## What Changes
 
-- **Replace terminal renderer**: Remove `amuxterm-web` (Rust WASM) and `amuxshell-web`'s custom textarea input in favor of `ghostty-web`
-- **Simplify backend**: Remove terminal state parsing from `amuxd` (vte, vt100, unicode-width, unicode-segmentation dependencies)
-- **Bidirectional WebSocket**: Terminal I/O flows over a single WebSocket connection with raw PTY bytes
-- **Delete `amuxterm-web`**: Entire crate is replaced by ghostty-web
-- **Unified keyboard area on mobile**: Modifier buttons + input area for mobile, direct keyboard capture on desktop
+- **Replace terminal renderer**: Remove `amuxterm-web` (Rust WASM) and move browser rendering to `ghostty-web`
+- **Preserve deterministic bootstrap/resync**: Keep `GET /sessions/{session_id}/terminal` as the authoritative snapshot endpoint, but source it from tmux capture or equivalent backend capture rather than `vt100` state
+- **Upgrade live transport**: Convert `GET /sessions/{session_id}/terminal/stream` into a bidirectional WebSocket for live terminal I/O
+- **Use a safe wire protocol**: Stream raw PTY/input bytes in WebSocket binary frames and reserve WebSocket text frames for JSON control messages such as resize
+- **Delete `amuxterm-web`**: Entire crate is replaced by `ghostty-web`
+- **Improve input UX**: Desktop terminals capture keyboard input directly; mobile uses a unified modifier row plus hidden text input that forwards edits immediately
 
 ## Capabilities
 
 ### New Capabilities
 
-- `ghostty-terminal-stream`: Ghostty-web receives raw PTY bytes over WebSocket, renders terminal output, and sends keystrokes back over the same connection
-- `terminal-resize`: Terminal dimensions sent over WebSocket control channel to resize the PTY
-- `mobile-terminal-input`: Unified keyboard area with modifier buttons and text input for mobile browsers
+- `ghostty-terminal-stream`: ghostty-web receives live PTY bytes over WebSocket, renders terminal output, and sends keyboard input back over the same connection
+- `terminal-resize`: Terminal dimensions are sent as explicit WebSocket control messages to resize the PTY
+- `mobile-terminal-input`: Mobile browsers get a unified keyboard area with modifier buttons and immediate input forwarding
 
 ### Modified Capabilities
 
-- `terminal-stream-transport-v1`: Change transport from JSON snapshots/diffs to raw PTY bytes over WebSocket
-- `terminal-web-surface-v1`: Deprecate - rendering handled entirely by ghostty-web client-side
+- `terminal-stream-transport-v1`: Keep snapshot bootstrap/resync, but replace diff streaming with bidirectional raw-byte streaming
+- `selected-session-shell-stream-v1`: Keep snapshot-first shell loading, but reconnect the selected session through the new bidirectional stream contract
+- `terminal-web-surface-v1`: Replace the renderer baseline while retaining browser, reliability, and performance expectations
 
 ## Impact
 
-- **amuxd**: Remove terminal.rs, vte/vt100 parsing, simplify terminal streaming endpoint to raw byte passthrough
+- **amuxd**: Remove `terminal.rs` and the `vte`/`vt100` parsing stack, keep `GET /sessions/{session_id}/terminal` for bootstrap/resync capture, and convert `/terminal/stream` to a bidirectional binary/control WebSocket
 - **amuxterm-web**: Delete entire crate
-- **amuxshell-web**: Replace WASM renderer with ghostty-web, implement unified keyboard area for mobile
-- **Dependencies**: Remove vte, vt100, unicode-width, unicode-segmentation from amuxd; add ghostty-web to amuxshell-web
+- **amuxshell-web**: Replace the WASM renderer with `ghostty-web`, reconnect the shell through snapshot + bidirectional stream, and implement unified mobile input
+- **Dependencies**: Remove `vte`, `vt100`, `unicode-width`, and `unicode-segmentation` from `amuxd`; add `ghostty-web` to `amuxshell-web`
