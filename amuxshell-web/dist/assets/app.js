@@ -2,8 +2,8 @@ import initRendererModule, {
   WasmCanvasRenderer
 } from "./vendor/amuxterm_web.js";
 import {
-  POLL_INTERVAL_MS,
   acknowledgeInputFocus,
+  applyTerminalStreamFrame,
   applySessions,
   applyWorkspaceResources,
   applyWorkspaces,
@@ -25,9 +25,12 @@ import {
   setPageVisibility,
   setSocketStatus,
   setTerminalSurface,
+  setTerminalStreamStatus,
   setTerminalUnavailable,
-  shouldPollTerminal,
+  shouldConnectTerminalStream,
+  shouldResyncTerminalOnVisibilityRestore,
   shouldRefetchSessionsOnSocketOpen,
+  TERMINAL_STREAM_RECONNECT_DELAY_MS,
   toggleCtrlModifier
 } from "./core.js";
 
@@ -36,9 +39,15 @@ const root = document.querySelector("#shell-root");
 let state = createShellState(window.location.pathname, document.visibilityState);
 let renderer = null;
 let rendererCanvas = null;
-let pollingTimer = null;
 let socket = null;
 let reconnectTimer = null;
+let terminalSocket = null;
+let terminalSocketSessionId = null;
+let terminalExpectedCloseSocket = null;
+let terminalReconnectTimer = null;
+let terminalStreamReady = false;
+let terminalBufferedFrames = [];
+let terminalFrameQueue = Promise.resolve();
 let terminalRequestId = 0;
 
 root.addEventListener("click", (event) => {
@@ -76,10 +85,7 @@ async function boot() {
   await refetchWorkspaces();
   await refetchSessions({ replaceHistory: true });
   connectSocket(false);
-  if (state.selectedSessionId) {
-    await refreshTerminal(true);
-  }
-  updatePolling();
+  await ensureSelectedTerminalTransport(false, true);
 }
 
 async function runAction(action) {
@@ -165,20 +171,17 @@ async function handleClick(event) {
 
   if (button.dataset.sessionSelect) {
     state = selectSession(state, button.dataset.sessionSelect);
+    state = setTerminalStreamStatus(state, "connecting");
     navigate(state.route.pathname);
     render();
-    await refreshTerminal(true);
-    updatePolling();
+    await ensureSelectedTerminalTransport(false, true);
     return;
   }
 
   if (button.dataset.sessionTerminate) {
     await apiDelete(`/sessions/${button.dataset.sessionTerminate}`);
     await refetchSessions({ replaceHistory: true });
-    if (state.selectedSessionId) {
-      await refreshTerminal(true);
-    }
-    updatePolling();
+    await ensureSelectedTerminalTransport(false, true);
     return;
   }
 
@@ -195,10 +198,10 @@ async function handleClick(event) {
     });
     const sessions = await apiGet("/sessions");
     state = handleCreateSuccess(state, created.id, sessions);
+    state = setTerminalStreamStatus(state, "connecting");
     navigate(sessionRoute(created.id));
     render();
-    await refreshTerminal(true);
-    updatePolling();
+    await ensureSelectedTerminalTransport(false, true);
     return;
   }
 
@@ -256,10 +259,10 @@ async function handleSubmit(event) {
     });
     const sessions = await apiGet("/sessions");
     state = handleCreateSuccess(state, created.id, sessions);
+    state = setTerminalStreamStatus(state, "connecting");
     navigate(sessionRoute(created.id));
     render();
-    await refreshTerminal(true);
-    updatePolling();
+    await ensureSelectedTerminalTransport(false, true);
     form.reset();
     return;
   }
@@ -324,15 +327,17 @@ async function handlePopState() {
       ...state,
       route: parseShellRoute(window.location.pathname),
       terminalSurface: null,
-      terminalUnavailable: false
+      terminalUnavailable: false,
+      terminalLastSequence: null
     },
     state.sessions
   );
+  state = setTerminalStreamStatus(
+    state,
+    state.selectedSessionId ? "connecting" : "idle"
+  );
   render();
-  if (state.selectedSessionId) {
-    await refreshTerminal(true);
-  }
-  updatePolling();
+  await ensureSelectedTerminalTransport(false, true);
 }
 
 function handleResize() {
@@ -342,10 +347,19 @@ function handleResize() {
 async function handleVisibilityChange() {
   const wasVisible = state.pageVisible;
   state = setPageVisibility(state, document.visibilityState !== "hidden");
-  updatePolling();
-  if (!wasVisible && state.pageVisible && state.selectedSessionId) {
-    await refreshTerminal(false);
+  if (!state.pageVisible) {
+    disconnectTerminalStream();
+    render();
+    return;
   }
+
+  if (shouldResyncTerminalOnVisibilityRestore(wasVisible, state)) {
+    state = setTerminalStreamStatus(state, "reconnecting");
+    render();
+    await ensureSelectedTerminalTransport(true, true);
+    return;
+  }
+
   render();
 }
 
@@ -387,16 +401,12 @@ async function refetchSessions({ replaceHistory = false } = {}) {
   render();
 }
 
-async function refreshTerminal(forceRender) {
-  if (!state.selectedSessionId) {
-    return;
-  }
-
+async function refreshTerminalSnapshot(sessionId, forceRender) {
   const requestId = ++terminalRequestId;
   try {
-    const surface = await apiGet(`/sessions/${state.selectedSessionId}/terminal`);
-    if (requestId !== terminalRequestId || !state.selectedSessionId) {
-      return;
+    const surface = await apiGet(`/sessions/${sessionId}/terminal`);
+    if (requestId !== terminalRequestId || state.selectedSessionId !== sessionId) {
+      return false;
     }
 
     const firstSurface = !state.terminalSurface || state.terminalUnavailable;
@@ -406,39 +416,210 @@ async function refreshTerminal(forceRender) {
     } else {
       paintTerminal();
     }
+    return true;
   } catch (error) {
     if (error.status !== 404) {
       throw error;
     }
 
-    const selectedSessionId = state.selectedSessionId;
+    const selectedSessionId = sessionId;
     await refetchSessions({ replaceHistory: true });
     if (state.selectedSessionId === selectedSessionId && selectedSessionId) {
       state = setTerminalUnavailable(state, true);
       render();
     }
-    updatePolling();
+    disconnectTerminalStream();
+    return false;
   }
 }
 
 async function submitTerminalInput(payload) {
   await apiPost(`/sessions/${state.selectedSessionId}/terminal/input`, payload);
-  await refreshTerminal(false);
 }
 
-function updatePolling() {
-  if (pollingTimer) {
-    clearInterval(pollingTimer);
-    pollingTimer = null;
-  }
+async function ensureSelectedTerminalTransport(reconnected, forceRender) {
+  disconnectTerminalStream({ preserveStatus: true });
 
-  if (!shouldPollTerminal(state)) {
+  if (!shouldConnectTerminalStream(state)) {
+    state = setTerminalStreamStatus(
+      state,
+      state.selectedSessionId ? "disconnected" : "idle"
+    );
+    render();
     return;
   }
 
-  pollingTimer = window.setInterval(() => {
-    void runAction(() => refreshTerminal(false));
-  }, POLL_INTERVAL_MS);
+  state = setTerminalStreamStatus(state, reconnected ? "reconnecting" : "connecting");
+  render();
+
+  const sessionId = state.selectedSessionId;
+  const snapshotLoaded = await refreshTerminalSnapshot(sessionId, forceRender);
+  if (
+    !snapshotLoaded ||
+    state.selectedSessionId !== sessionId ||
+    !shouldConnectTerminalStream(state)
+  ) {
+    return;
+  }
+
+  connectTerminalStream(sessionId);
+}
+
+async function reconcileSelectedTerminalTransport() {
+  if (!shouldConnectTerminalStream(state)) {
+    disconnectTerminalStream();
+    state = setTerminalStreamStatus(
+      state,
+      state.selectedSessionId ? "disconnected" : "idle"
+    );
+    render();
+    return;
+  }
+
+  if (terminalSocket && terminalSocketSessionId === state.selectedSessionId) {
+    return;
+  }
+
+  await ensureSelectedTerminalTransport(false, true);
+}
+
+function connectTerminalStream(sessionId) {
+  if (!sessionId) {
+    return;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const nextSocket = new WebSocket(
+    `${protocol}//${window.location.host}/sessions/${encodeURIComponent(sessionId)}/terminal/stream`
+  );
+
+  terminalSocket = nextSocket;
+  terminalSocketSessionId = sessionId;
+  terminalStreamReady = false;
+  terminalBufferedFrames = [];
+
+  nextSocket.addEventListener("open", () => {
+    if (terminalSocket !== nextSocket || state.selectedSessionId !== sessionId) {
+      return;
+    }
+
+    state = setTerminalStreamStatus(state, "connected");
+    terminalStreamReady = true;
+    render();
+
+    const bufferedFrames = terminalBufferedFrames.splice(0);
+    for (const payload of bufferedFrames) {
+      queueTerminalPayload(nextSocket, sessionId, payload);
+    }
+  });
+
+  nextSocket.addEventListener("message", (message) => {
+    if (terminalSocket !== nextSocket || typeof message.data !== "string") {
+      return;
+    }
+
+    if (!terminalStreamReady) {
+      terminalBufferedFrames.push(message.data);
+      return;
+    }
+
+    queueTerminalPayload(nextSocket, sessionId, message.data);
+  });
+
+  nextSocket.addEventListener("close", () => {
+    const expectedClose = terminalExpectedCloseSocket === nextSocket;
+    if (expectedClose) {
+      terminalExpectedCloseSocket = null;
+    }
+
+    if (terminalSocket === nextSocket) {
+      terminalSocket = null;
+      terminalSocketSessionId = null;
+      terminalStreamReady = false;
+      terminalBufferedFrames = [];
+    }
+
+    if (expectedClose) {
+      return;
+    }
+
+    if (terminalSocket !== null) {
+      return;
+    }
+
+    void runAction(async () => {
+      await refetchSessions({ replaceHistory: true });
+      if (state.selectedSessionId === sessionId && shouldConnectTerminalStream(state)) {
+        state = setTerminalStreamStatus(state, "reconnecting");
+        render();
+        scheduleTerminalReconnect();
+        return;
+      }
+
+      state = setTerminalStreamStatus(
+        state,
+        state.selectedSessionId ? "disconnected" : "idle"
+      );
+      render();
+    });
+  });
+
+  nextSocket.addEventListener("error", () => {
+    nextSocket.close();
+  });
+}
+
+function queueTerminalPayload(nextSocket, sessionId, payloadText) {
+  terminalFrameQueue = terminalFrameQueue
+    .catch(() => undefined)
+    .then(() => runAction(() => handleTerminalStreamPayload(nextSocket, sessionId, payloadText)));
+}
+
+async function handleTerminalStreamPayload(nextSocket, sessionId, payloadText) {
+  if (terminalSocket !== nextSocket || state.selectedSessionId !== sessionId) {
+    return;
+  }
+
+  const payload = JSON.parse(payloadText);
+  if (payload.session_id !== sessionId) {
+    return;
+  }
+
+  const result = applyTerminalStreamFrame(state, payload);
+  if (result.needsResync) {
+    await ensureSelectedTerminalTransport(true, true);
+    return;
+  }
+
+  state = result.state;
+  paintTerminal();
+}
+
+function disconnectTerminalStream({ preserveStatus = false } = {}) {
+  if (terminalReconnectTimer) {
+    window.clearTimeout(terminalReconnectTimer);
+    terminalReconnectTimer = null;
+  }
+
+  terminalStreamReady = false;
+  terminalBufferedFrames = [];
+  terminalSocketSessionId = null;
+
+  if (terminalSocket) {
+    const activeSocket = terminalSocket;
+    terminalExpectedCloseSocket = activeSocket;
+    terminalSocket = null;
+    activeSocket.close();
+  } else {
+    terminalExpectedCloseSocket = null;
+  }
+
+  if (!preserveStatus) {
+    state = setTerminalStreamStatus(
+      state,
+      state.selectedSessionId ? "disconnected" : "idle"
+    );
+  }
 }
 
 function connectSocket(reconnected) {
@@ -473,11 +654,13 @@ function connectSocket(reconnected) {
     const payload = JSON.parse(message.data);
     if (eventRequiresSessionRefresh(payload)) {
       await runAction(async () => {
+        const previousSelectedSessionId = state.selectedSessionId;
         await refetchSessions({ replaceHistory: true });
-        if (state.selectedSessionId) {
-          await refreshTerminal(true);
+        if (state.selectedSessionId !== previousSelectedSessionId) {
+          await ensureSelectedTerminalTransport(false, true);
+        } else {
+          await reconcileSelectedTerminalTransport();
         }
-        updatePolling();
       });
     }
   });
@@ -506,6 +689,17 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connectSocket(true);
   }, 1000);
+}
+
+function scheduleTerminalReconnect() {
+  if (terminalReconnectTimer) {
+    window.clearTimeout(terminalReconnectTimer);
+  }
+
+  terminalReconnectTimer = window.setTimeout(() => {
+    terminalReconnectTimer = null;
+    void runAction(() => ensureSelectedTerminalTransport(true, false));
+  }, TERMINAL_STREAM_RECONNECT_DELAY_MS);
 }
 
 function navigate(pathname, replace = false) {

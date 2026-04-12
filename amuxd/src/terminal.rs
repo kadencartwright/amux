@@ -145,7 +145,53 @@ pub struct TerminalSnapshot {
     pub modes: TerminalModes,
     pub escape_sequence_metrics: EscapeSequenceMetrics,
     pub lines: Vec<TerminalLine>,
+    pub scrollback: Vec<TerminalLine>,
     pub plain_text: String,
+}
+
+impl TerminalSnapshot {
+    pub fn with_scrollback(mut self, scrollback: Vec<TerminalLine>, plain_text: String) -> Self {
+        self.scrollback = scrollback;
+        self.plain_text = plain_text;
+        self
+    }
+
+    pub fn diff_frame(
+        &self,
+        session_id: &str,
+        sequence: u64,
+        previous: Option<&Self>,
+    ) -> TerminalStreamFrame {
+        let lines = match previous {
+            None => self.lines.clone(),
+            Some(previous) if previous.rows != self.rows || previous.cols != self.cols => {
+                self.lines.clone()
+            }
+            Some(previous) => self
+                .lines
+                .iter()
+                .filter(|line| {
+                    previous
+                        .lines
+                        .iter()
+                        .find(|candidate| candidate.row == line.row)
+                        != Some(*line)
+                })
+                .cloned()
+                .collect(),
+        };
+
+        TerminalStreamFrame {
+            session_id: session_id.to_string(),
+            sequence,
+            rows: self.rows,
+            cols: self.cols,
+            cursor: self.cursor.clone(),
+            modes: self.modes.clone(),
+            escape_sequence_metrics: self.escape_sequence_metrics.clone(),
+            lines,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +261,18 @@ pub struct TerminalLine {
     pub row: u16,
     pub wrapped: bool,
     pub cells: Vec<TerminalCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalStreamFrame {
+    pub session_id: String,
+    pub sequence: u64,
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor: TerminalCursor,
+    pub modes: TerminalModes,
+    pub escape_sequence_metrics: EscapeSequenceMetrics,
+    pub lines: Vec<TerminalLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,6 +405,7 @@ impl TerminalCore {
             },
             escape_sequence_metrics: self.escape_tracker.metrics.clone(),
             lines,
+            scrollback: Vec::new(),
             plain_text: screen.contents(),
         }
     }

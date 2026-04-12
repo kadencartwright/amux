@@ -1,4 +1,4 @@
-export const POLL_INTERVAL_MS = 250;
+export const TERMINAL_STREAM_RECONNECT_DELAY_MS = 1000;
 
 export const MOBILE_MODIFIER_CONTROLS = [
   { label: "Ctrl", action: "toggle-ctrl" },
@@ -44,6 +44,8 @@ export function createShellState(pathname, visibilityState = "visible") {
     sessionUnavailable: false,
     terminalUnavailable: false,
     terminalSurface: null,
+    terminalStreamStatus: "idle",
+    terminalLastSequence: null,
     pageVisible: visibilityState !== "hidden",
     mobileNavOpen: false,
     socketStatus: "connecting",
@@ -101,6 +103,8 @@ export function applySessions(state, sessions) {
       ...next,
       terminalSurface: null,
       terminalUnavailable: false,
+      terminalStreamStatus: next.selectedSessionId ? "disconnected" : "idle",
+      terminalLastSequence: null,
       ctrlModifierLatched: false
     };
   }
@@ -173,7 +177,8 @@ export function setTerminalSurface(state, terminalSurface) {
   return {
     ...state,
     terminalSurface,
-    terminalUnavailable: false
+    terminalUnavailable: false,
+    terminalLastSequence: null
   };
 }
 
@@ -181,7 +186,23 @@ export function setTerminalUnavailable(state, unavailable) {
   return {
     ...state,
     terminalUnavailable: unavailable,
-    terminalSurface: unavailable ? null : state.terminalSurface
+    terminalSurface: unavailable ? null : state.terminalSurface,
+    terminalStreamStatus: unavailable ? "disconnected" : state.terminalStreamStatus,
+    terminalLastSequence: unavailable ? null : state.terminalLastSequence
+  };
+}
+
+export function setTerminalStreamStatus(state, terminalStreamStatus) {
+  return {
+    ...state,
+    terminalStreamStatus
+  };
+}
+
+export function setTerminalSequence(state, terminalLastSequence) {
+  return {
+    ...state,
+    terminalLastSequence
   };
 }
 
@@ -216,10 +237,14 @@ export function clearNotice(state) {
   };
 }
 
-export function shouldPollTerminal(state) {
+export function shouldConnectTerminalStream(state) {
   return Boolean(
     state.selectedSessionId && state.pageVisible && !state.terminalUnavailable
   );
+}
+
+export function shouldResyncTerminalOnVisibilityRestore(wasVisible, state) {
+  return Boolean(!wasVisible && state.pageVisible && state.selectedSessionId);
 }
 
 export function eventRequiresSessionRefresh(event) {
@@ -230,6 +255,76 @@ export function eventRequiresSessionRefresh(event) {
 
 export function shouldRefetchSessionsOnSocketOpen(reconnected) {
   return Boolean(reconnected);
+}
+
+export function applyTerminalStreamFrame(state, frame) {
+  if (!state.terminalSurface) {
+    return {
+      state,
+      needsResync: true,
+      reason: "missing_snapshot"
+    };
+  }
+
+  if (
+    state.terminalLastSequence !== null &&
+    frame.sequence !== state.terminalLastSequence + 1
+  ) {
+    return {
+      state,
+      needsResync: true,
+      reason: "sequence_gap"
+    };
+  }
+
+  const previousSnapshot = state.terminalSurface.snapshot;
+  const baseLines =
+    previousSnapshot.rows === frame.rows && previousSnapshot.cols === frame.cols
+      ? previousSnapshot.lines.map((line) => ({
+          row: line.row,
+          wrapped: line.wrapped,
+          cells: line.cells.map((cell) => ({ ...cell }))
+        }))
+      : createBlankTerminalLines(frame.rows, frame.cols);
+  const lineIndex = new Map(baseLines.map((line, index) => [line.row, index]));
+
+  for (const line of frame.lines) {
+    const replacement = {
+      row: line.row,
+      wrapped: line.wrapped,
+      cells: line.cells.map((cell) => ({ ...cell }))
+    };
+    const existingIndex = lineIndex.get(line.row);
+    if (existingIndex === undefined) {
+      baseLines.push(replacement);
+      continue;
+    }
+    baseLines[existingIndex] = replacement;
+  }
+
+  baseLines.sort((left, right) => left.row - right.row);
+
+  return {
+    state: {
+      ...state,
+      terminalUnavailable: false,
+      terminalLastSequence: frame.sequence,
+      terminalSurface: {
+        ...state.terminalSurface,
+        snapshot: {
+          ...previousSnapshot,
+          rows: frame.rows,
+          cols: frame.cols,
+          cursor: frame.cursor,
+          modes: frame.modes,
+          escape_sequence_metrics: frame.escape_sequence_metrics,
+          lines: baseLines
+        }
+      }
+    },
+    needsResync: false,
+    reason: null
+  };
 }
 
 export function buildTextInputRequest(
@@ -504,11 +599,7 @@ function renderTerminalPane(state, selectedSession) {
          <canvas id="terminal-canvas" class="terminal-frame__canvas" aria-label="Terminal surface"></canvas>
        </div>`;
 
-  const terminalMeta = state.terminalUnavailable
-    ? "Terminal polling paused"
-    : state.terminalSurface
-      ? `Polling every ${POLL_INTERVAL_MS} ms while visible`
-      : "Waiting for the first terminal snapshot";
+  const terminalMeta = terminalStreamLabel(state.terminalStreamStatus);
 
   const inputControls = state.terminalUnavailable
     ? ""
@@ -522,7 +613,7 @@ function renderTerminalPane(state, selectedSession) {
         >${escapeHtml(state.inputDraft)}</textarea>
         <div class="terminal-input__actions">
           <button type="submit">Send + Enter</button>
-          <span class="terminal-input__hint">The submit button sends the text and presses Enter, then refreshes the terminal.</span>
+          <span class="terminal-input__hint">The submit button sends the text and presses Enter while the selected-session stream stays read-only.</span>
         </div>
       </form>
       <div class="terminal-modifiers" data-testid="mobile-modifiers">
@@ -536,9 +627,8 @@ function renderTerminalPane(state, selectedSession) {
         <div>
           <p class="shell__eyebrow">Selected session</p>
           <h2>${escapeHtml(selectedSession.name)}</h2>
-          <p class="terminal-shell__context">${escapeHtml(sessionContextLabel(selectedSession))}</p>
         </div>
-        <p class="terminal-shell__meta" data-role="terminal-meta">${escapeHtml(terminalMeta)}</p>
+        <span class="shell__status shell__status--${escapeAttribute(state.terminalStreamStatus)}" data-role="terminal-stream-status">${escapeHtml(terminalMeta)}</span>
       </div>
       ${unavailable}
       ${inputControls}
@@ -720,6 +810,43 @@ function sessionContextLabel(session) {
   }
 
   return `${workspaceName} · local`;
+}
+
+function createBlankTerminalLines(rows, cols) {
+  return Array.from({ length: rows }, (_, row) => ({
+    row,
+    wrapped: false,
+    cells: Array.from({ length: cols }, (_, column) => ({
+      column,
+      text: "",
+      column_span: 1,
+      unicode_width: 0,
+      grapheme_count: 0,
+      is_wide: false,
+      is_wide_continuation: false,
+      foreground: { kind: "default" },
+      background: { kind: "default" },
+      bold: false,
+      italic: false,
+      underline: false,
+      inverse: false
+    }))
+  }));
+}
+
+function terminalStreamLabel(status) {
+  switch (status) {
+    case "connected":
+      return "Stream connected";
+    case "connecting":
+      return "Stream connecting";
+    case "reconnecting":
+      return "Stream reconnecting";
+    case "disconnected":
+      return "Stream disconnected";
+    default:
+      return "Stream idle";
+  }
 }
 
 function normalizePath(pathname) {

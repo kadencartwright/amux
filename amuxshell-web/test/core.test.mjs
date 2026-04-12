@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  POLL_INTERVAL_MS,
+  TERMINAL_STREAM_RECONNECT_DELAY_MS,
   applySessions,
+  applyTerminalStreamFrame,
   applyWorkspaces,
   buildNamedKeyRequest,
   buildTextInputRequest,
@@ -14,8 +15,10 @@ import {
   selectSession,
   selectWorkspace,
   setPageVisibility,
-  shouldPollTerminal,
-  shouldRefetchSessionsOnSocketOpen
+  setTerminalSurface,
+  shouldConnectTerminalStream,
+  shouldRefetchSessionsOnSocketOpen,
+  shouldResyncTerminalOnVisibilityRestore
 } from "../src/core.js";
 
 const workspaces = [
@@ -97,26 +100,32 @@ test("create auto-selection navigates to the new session and requests focus", ()
   assert.equal(state.focusTerminalInput, true);
 });
 
-test("polling only runs for visible selected sessions", () => {
+test("terminal stream only connects for visible selected sessions", () => {
   let state = applySessions(
     applyWorkspaces(createShellState("/app/sessions/alpha-local"), workspaces),
     sessions
   );
-  assert.equal(shouldPollTerminal(state), true);
+  assert.equal(shouldConnectTerminalStream(state), true);
 
   state = setPageVisibility(state, false);
-  assert.equal(shouldPollTerminal(state), false);
+  assert.equal(shouldConnectTerminalStream(state), false);
 
   state = setPageVisibility(state, true);
   state = {
     ...state,
     terminalUnavailable: true
   };
-  assert.equal(shouldPollTerminal(state), false);
-  assert.equal(POLL_INTERVAL_MS, 250);
+  assert.equal(shouldConnectTerminalStream(state), false);
+  assert.equal(TERMINAL_STREAM_RECONNECT_DELAY_MS, 1000);
 });
 
-test("lifecycle invalidation and reconnect both imply a REST refetch", () => {
+test("lifecycle invalidation and recovery triggers drive the expected resyncs", () => {
+  const visibleState = applySessions(
+    applyWorkspaces(createShellState("/app/sessions/alpha-local", "hidden"), workspaces),
+    sessions
+  );
+  const restoredState = setPageVisibility(visibleState, true);
+
   assert.equal(
     eventRequiresSessionRefresh({ event_type: "session.created" }),
     true
@@ -124,17 +133,122 @@ test("lifecycle invalidation and reconnect both imply a REST refetch", () => {
   assert.equal(eventRequiresSessionRefresh({ event_type: "other.event" }), false);
   assert.equal(shouldRefetchSessionsOnSocketOpen(true), true);
   assert.equal(shouldRefetchSessionsOnSocketOpen(false), false);
+  assert.equal(shouldResyncTerminalOnVisibilityRestore(false, restoredState), true);
 });
 
-test("shell markup includes workspace registration and worktree launch controls", () => {
-  const state = {
-    ...selectSession(
+test("stream frames merge row diffs and advance the selected-session sequence", () => {
+  const selected = selectSession(
+    applySessions(
+      selectWorkspace(applyWorkspaces(createShellState("/app"), workspaces), "ws-alpha"),
+      sessions
+    ),
+    "alpha-local"
+  );
+  const surface = sampleTerminalSurface("alpha-local");
+
+  let state = setTerminalSurface(selected, surface);
+  let result = applyTerminalStreamFrame(state, {
+    session_id: "alpha-local",
+    sequence: 1,
+    rows: 2,
+    cols: 3,
+    cursor: { row: 1, col: 2, visible: true },
+    modes: surface.snapshot.modes,
+    escape_sequence_metrics: surface.snapshot.escape_sequence_metrics,
+    lines: [
+      {
+        row: 1,
+        wrapped: false,
+        cells: [
+          blankCell(0, "p"),
+          blankCell(1, "w"),
+          blankCell(2, "d")
+        ]
+      }
+    ]
+  });
+
+  assert.equal(result.needsResync, false);
+  state = result.state;
+  assert.equal(state.terminalLastSequence, 1);
+  assert.deepEqual(
+    state.terminalSurface.snapshot.lines[1].cells.map((cell) => cell.text),
+    ["p", "w", "d"]
+  );
+
+  result = applyTerminalStreamFrame(state, {
+    session_id: "alpha-local",
+    sequence: 2,
+    rows: 2,
+    cols: 3,
+    cursor: { row: 0, col: 1, visible: true },
+    modes: surface.snapshot.modes,
+    escape_sequence_metrics: surface.snapshot.escape_sequence_metrics,
+    lines: [
+      {
+        row: 0,
+        wrapped: false,
+        cells: [
+          blankCell(0, "o"),
+          blankCell(1, "k"),
+          blankCell(2, "!")
+        ]
+      }
+    ]
+  });
+
+  assert.equal(result.needsResync, false);
+  assert.equal(result.state.terminalLastSequence, 2);
+  assert.deepEqual(
+    result.state.terminalSurface.snapshot.lines[0].cells.map((cell) => cell.text),
+    ["o", "k", "!"]
+  );
+});
+
+test("sequence gaps force a full selected-session resync", () => {
+  const baseState = setTerminalSurface(
+    selectSession(
       applySessions(
         selectWorkspace(applyWorkspaces(createShellState("/app"), workspaces), "ws-alpha"),
         sessions
       ),
       "alpha-local"
     ),
+    sampleTerminalSurface("alpha-local")
+  );
+  const state = {
+    ...baseState,
+    terminalLastSequence: 2
+  };
+
+  const result = applyTerminalStreamFrame(state, {
+    session_id: "alpha-local",
+    sequence: 4,
+    rows: 2,
+    cols: 3,
+    cursor: { row: 1, col: 0, visible: true },
+    modes: state.terminalSurface.snapshot.modes,
+    escape_sequence_metrics: state.terminalSurface.snapshot.escape_sequence_metrics,
+    lines: []
+  });
+
+  assert.equal(result.needsResync, true);
+  assert.equal(result.reason, "sequence_gap");
+});
+
+test("shell markup keeps the selected-session overview minimal and stream-focused", () => {
+  const state = {
+    ...setTerminalSurface(
+      selectSession(
+        applySessions(
+          selectWorkspace(applyWorkspaces(createShellState("/app"), workspaces), "ws-alpha"),
+          sessions
+        ),
+        "alpha-local"
+      ),
+      sampleTerminalSurface("alpha-local")
+    ),
+    terminalStreamStatus: "connected",
     sourceRefs: [
       { name: "main", kind: "local_branch" },
       { name: "origin/main", kind: "remote_tracking_branch" }
@@ -148,22 +262,30 @@ test("shell markup includes workspace registration and worktree launch controls"
   assert.match(markup, /Create local session/);
   assert.match(markup, /Create managed worktree/);
   assert.match(markup, /data-worktree-session-create="wt-1"/);
-  assert.match(markup, /alpha · worktree:feature-a/);
+  assert.match(markup, /data-role="terminal-stream-status">Stream connected/);
+  assert.doesNotMatch(markup, /terminal-shell__context/);
 });
 
-test("selecting a different workspace clears stale workspace resources", () => {
-  const state = selectWorkspace(
-    {
-      ...applyWorkspaces(createShellState("/app"), workspaces),
-      managedWorktrees: [{ id: "wt-1" }],
-      sourceRefs: [{ name: "main", kind: "local_branch" }]
-    },
-    "ws-beta"
-  );
+test("losing the selected session clears stale terminal state", () => {
+  const selectedState = {
+    ...setTerminalSurface(
+      selectSession(
+        applySessions(
+          selectWorkspace(applyWorkspaces(createShellState("/app"), workspaces), "ws-alpha"),
+          sessions
+        ),
+        "alpha-local"
+      ),
+      sampleTerminalSurface("alpha-local")
+    ),
+    terminalLastSequence: 7
+  };
+  const nextState = applySessions(selectedState, [sessions[1]]);
 
-  assert.equal(state.selectedWorkspaceId, "ws-beta");
-  assert.deepEqual(state.managedWorktrees, []);
-  assert.deepEqual(state.sourceRefs, []);
+  assert.equal(nextState.selectedSessionId, null);
+  assert.equal(nextState.route.pathname, "/app");
+  assert.equal(nextState.terminalSurface, null);
+  assert.equal(nextState.terminalLastSequence, null);
 });
 
 test("terminal input helpers map text and named keys onto daemon contract", () => {
@@ -208,3 +330,59 @@ test("terminal input helpers map text and named keys onto daemon contract", () =
     ]
   });
 });
+
+function sampleTerminalSurface(sessionId) {
+  return {
+    session_id: sessionId,
+    snapshot: {
+      rows: 2,
+      cols: 3,
+      cursor: { row: 0, col: 0, visible: true },
+      modes: {
+        application_cursor: false,
+        application_keypad: false,
+        bracketed_paste: true,
+        alternate_screen: false
+      },
+      escape_sequence_metrics: {
+        print: 0,
+        execute: 0,
+        csi: 0,
+        esc: 0,
+        osc: 0,
+        dcs: 0
+      },
+      lines: [
+        {
+          row: 0,
+          wrapped: false,
+          cells: [blankCell(0, "a"), blankCell(1, "b"), blankCell(2, "c")]
+        },
+        {
+          row: 1,
+          wrapped: false,
+          cells: [blankCell(0, "x"), blankCell(1, "y"), blankCell(2, "z")]
+        }
+      ],
+      plain_text: "abc\nxyz"
+    }
+  };
+}
+
+function blankCell(column, text) {
+  return {
+    column,
+    text,
+    column_span: 1,
+    unicode_width: text ? 1 : 0,
+    grapheme_count: text ? 1 : 0,
+    is_wide: false,
+    is_wide_continuation: false,
+    foreground: { kind: "default" },
+    background: { kind: "default" },
+    bold: false,
+    italic: false,
+    underline: false,
+    inverse: false
+  };
+}

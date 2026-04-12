@@ -24,10 +24,13 @@ use store::{
 };
 use terminal::{
     TerminalCore, TerminalCursor, TerminalInputEvent, TerminalInputRequest, TerminalInputResponse,
-    TerminalSnapshot, TerminalSurfaceState,
+    TerminalLine, TerminalSnapshot, TerminalStreamFrame, TerminalSurfaceState,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+use tokio::time::{self, Duration, MissedTickBehavior};
 use uuid::Uuid;
+
+const TERMINAL_STREAM_POLL_INTERVAL_MS: u64 = 75;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -338,7 +341,7 @@ impl SessionRuntime for TmuxRuntime {
     fn capture_terminal(&self, runtime_name: &str) -> Result<TerminalSnapshot, AppError> {
         let (rows, cols) = tmux_pane_size(runtime_name)?;
         let output = Command::new("tmux")
-            .args(["capture-pane", "-e", "-p", "-t", runtime_name])
+            .args(["capture-pane", "-e", "-p", "-S", "-", "-t", runtime_name])
             .output()
             .map_err(|error| {
                 AppError::Runtime(format!("failed to execute tmux capture-pane: {error}"))
@@ -351,10 +354,8 @@ impl SessionRuntime for TmuxRuntime {
             )));
         }
 
-        let mut core = TerminalCore::new(rows, cols, 0);
         let normalized = normalize_tmux_capture_stream(&output.stdout);
-        core.ingest(&normalized);
-        let mut snapshot = core.snapshot();
+        let mut snapshot = build_tmux_terminal_snapshot(rows, cols, &normalized);
         if let Some(cursor) = tmux_cursor(runtime_name)? {
             snapshot.cursor = cursor;
         }
@@ -470,6 +471,47 @@ fn normalize_tmux_capture_stream(bytes: &[u8]) -> Vec<u8> {
     }
 
     normalized
+}
+
+fn build_tmux_terminal_snapshot(rows: u16, cols: u16, normalized: &[u8]) -> TerminalSnapshot {
+    let mut visible = TerminalCore::new(rows, cols, 0);
+    visible.ingest(normalized);
+    let visible_snapshot = visible.snapshot();
+
+    let full_rows = tmux_capture_line_count(normalized, rows);
+    let mut full = TerminalCore::new(full_rows, cols, 0);
+    full.ingest(normalized);
+    let full_snapshot = full.snapshot();
+    let (scrollback, plain_text) = split_snapshot_scrollback(&full_snapshot, rows);
+
+    visible_snapshot.with_scrollback(scrollback, plain_text)
+}
+
+fn tmux_capture_line_count(normalized: &[u8], minimum_rows: u16) -> u16 {
+    let line_count = String::from_utf8_lossy(normalized).lines().count().max(1);
+    let bounded = line_count.max(usize::from(minimum_rows)).min(usize::from(u16::MAX));
+    u16::try_from(bounded).unwrap_or(u16::MAX)
+}
+
+fn split_snapshot_scrollback(snapshot: &TerminalSnapshot, visible_rows: u16) -> (Vec<TerminalLine>, String) {
+    let split_at = snapshot
+        .lines
+        .len()
+        .saturating_sub(usize::from(visible_rows));
+    let scrollback = reindex_terminal_lines(&snapshot.lines[..split_at]);
+    (scrollback, snapshot.plain_text.clone())
+}
+
+fn reindex_terminal_lines(lines: &[TerminalLine]) -> Vec<TerminalLine> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(row, line)| TerminalLine {
+            row: u16::try_from(row).unwrap_or(u16::MAX),
+            wrapped: line.wrapped,
+            cells: line.cells.clone(),
+        })
+        .collect()
 }
 
 fn tmux_pane_size(runtime_name: &str) -> Result<(u16, u16), AppError> {
@@ -622,6 +664,10 @@ pub fn build_router(state: AppState) -> Router {
     if state.config.terminal_renderer_v1_enabled {
         app = app
             .route("/sessions/:session_id/terminal", get(get_terminal_surface))
+            .route(
+                "/sessions/:session_id/terminal/stream",
+                get(ws_terminal_stream),
+            )
             .route(
                 "/sessions/:session_id/terminal/input",
                 post(post_terminal_input),
@@ -938,9 +984,18 @@ async fn get_terminal_surface(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> AppResult<Json<TerminalSurfaceState>> {
+    Ok(Json(capture_terminal_surface_state(&state, &session_id)?))
+}
+
+async fn ws_terminal_stream(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> AppResult<impl IntoResponse> {
     let stored = stored_session_by_id(&state, &session_id)?;
-    let snapshot = state.runtime.capture_terminal(&stored.runtime_name)?;
-    Ok(Json(TerminalSurfaceState::baseline(session_id, snapshot)))
+    Ok(ws.on_upgrade(move |socket| {
+        stream_terminal(socket, state, session_id, stored.runtime_name)
+    }))
 }
 
 async fn post_terminal_input(
@@ -969,6 +1024,130 @@ async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<Lifecy
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+#[derive(Clone)]
+enum TerminalStreamUpdate {
+    Snapshot(TerminalSnapshot),
+    Closed,
+}
+
+fn capture_terminal_surface_state(
+    state: &AppState,
+    session_id: &str,
+) -> Result<TerminalSurfaceState, AppError> {
+    let stored = stored_session_by_id(state, session_id)?;
+    let snapshot = state.runtime.capture_terminal(&stored.runtime_name)?;
+    Ok(TerminalSurfaceState::baseline(session_id.to_string(), snapshot))
+}
+
+fn capture_stream_terminal_snapshot(
+    state: &AppState,
+    session_id: &str,
+    runtime_name: &str,
+) -> Result<TerminalSnapshot, AppError> {
+    let stored = stored_session_by_id(state, session_id)?;
+    if stored.runtime_name != runtime_name {
+        return Err(session_not_found_error(session_id));
+    }
+
+    state.runtime.capture_terminal(runtime_name)
+}
+
+async fn stream_terminal(
+    mut socket: WebSocket,
+    state: AppState,
+    session_id: String,
+    runtime_name: String,
+) {
+    let Ok(initial_snapshot) = capture_stream_terminal_snapshot(&state, &session_id, &runtime_name)
+    else {
+        let _ = socket.close().await;
+        return;
+    };
+
+    let mut sequence = 1_u64;
+    if send_terminal_stream_frame(&mut socket, &initial_snapshot.diff_frame(&session_id, sequence, None))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let (updates_tx, mut updates_rx) = watch::channel(TerminalStreamUpdate::Snapshot(initial_snapshot.clone()));
+    let producer_state = state.clone();
+    let producer_session_id = session_id.clone();
+    let producer_runtime_name = runtime_name.clone();
+    let producer = tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_millis(TERMINAL_STREAM_POLL_INTERVAL_MS));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let mut latest_snapshot = initial_snapshot;
+        loop {
+            interval.tick().await;
+            match capture_stream_terminal_snapshot(
+                &producer_state,
+                &producer_session_id,
+                &producer_runtime_name,
+            ) {
+                Ok(snapshot) => {
+                    if snapshot != latest_snapshot {
+                        latest_snapshot = snapshot.clone();
+                        if updates_tx.send(TerminalStreamUpdate::Snapshot(snapshot)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = updates_tx.send(TerminalStreamUpdate::Closed);
+                    break;
+                }
+            }
+        }
+    });
+
+    let initial_update = updates_rx.borrow().clone();
+    let mut sent_snapshot = match initial_update {
+        TerminalStreamUpdate::Snapshot(snapshot) => snapshot,
+        TerminalStreamUpdate::Closed => {
+            let _ = socket.close().await;
+            producer.abort();
+            return;
+        }
+    };
+
+    loop {
+        if updates_rx.changed().await.is_err() {
+            break;
+        }
+
+        let update = updates_rx.borrow().clone();
+        match update {
+            TerminalStreamUpdate::Snapshot(snapshot) => {
+                sequence += 1;
+                let frame = snapshot.diff_frame(&session_id, sequence, Some(&sent_snapshot));
+                if send_terminal_stream_frame(&mut socket, &frame).await.is_err() {
+                    break;
+                }
+                sent_snapshot = snapshot;
+            }
+            TerminalStreamUpdate::Closed => {
+                let _ = socket.close().await;
+                break;
+            }
+        }
+    }
+
+    producer.abort();
+}
+
+async fn send_terminal_stream_frame(
+    socket: &mut WebSocket,
+    frame: &TerminalStreamFrame,
+) -> Result<(), axum::Error> {
+    let payload = serde_json::to_string(frame)
+        .map_err(|error| axum::Error::new(std::io::Error::other(error.to_string())))?;
+    socket.send(Message::Text(payload.into())).await
 }
 
 fn build_session_response(
@@ -1203,7 +1382,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use terminal::{
         EscapeSequenceMetrics, TerminalCell, TerminalColor, TerminalKey, TerminalLine,
-        TerminalModes, TerminalNamedKey,
+        TerminalModes, TerminalNamedKey, TerminalStreamFrame,
     };
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -1393,8 +1572,64 @@ mod tests {
                     }],
                 },
             ],
+            scrollback: Vec::new(),
             plain_text: "ab\n😀".to_string(),
         }
+    }
+
+    fn sample_snapshot_with_scrollback() -> TerminalSnapshot {
+        let mut snapshot = sample_snapshot();
+        snapshot.scrollback = vec![TerminalLine {
+            row: 0,
+            wrapped: false,
+            cells: vec![TerminalCell {
+                column: 0,
+                text: "$".to_string(),
+                column_span: 1,
+                unicode_width: 1,
+                grapheme_count: 1,
+                is_wide: false,
+                is_wide_continuation: false,
+                foreground: TerminalColor::Default,
+                background: TerminalColor::Default,
+                bold: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            }],
+        }];
+        snapshot.plain_text = "$\nab\n😀".to_string();
+        snapshot
+    }
+
+    fn snapshot_with_text(first: &str, second: &str) -> TerminalSnapshot {
+        let mut snapshot = sample_snapshot();
+        apply_text_to_line(&mut snapshot.lines[0], first);
+        apply_text_to_line(&mut snapshot.lines[1], second);
+        snapshot.plain_text = format!("{first}\n{second}");
+        snapshot
+    }
+
+    fn apply_text_to_line(line: &mut TerminalLine, text: &str) {
+        line.cells = text
+            .chars()
+            .enumerate()
+            .map(|(index, ch)| TerminalCell {
+                column: u16::try_from(index).unwrap_or(u16::MAX),
+                text: ch.to_string(),
+                column_span: 1,
+                unicode_width: 1,
+                grapheme_count: 1,
+                is_wide: false,
+                is_wide_continuation: false,
+                foreground: TerminalColor::Default,
+                background: TerminalColor::Default,
+                bold: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            })
+            .collect();
     }
 
     fn decode_json<T: for<'de> Deserialize<'de>, B: AsRef<[u8]>>(bytes: B) -> T {
@@ -1419,6 +1654,32 @@ mod tests {
             ))
             .expect("workspace req");
         let response = app.clone().oneshot(request).await.expect("workspace resp");
+        assert_eq!(response.status(), StatusCode::OK);
+        decode_json(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+    }
+
+    async fn create_local_session_request(app: &Router, workspace_id: &str, name: &str) -> Session {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": name,
+                    "workspace_id": workspace_id,
+                    "kind": "local",
+                }))
+                .expect("json"),
+            ))
+            .expect("session req");
+        let response = app.clone().oneshot(request).await.expect("session resp");
         assert_eq!(response.status(), StatusCode::OK);
         decode_json(
             response
@@ -2187,5 +2448,180 @@ mod tests {
                 shift: false,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_snapshot_bootstrap_includes_scrollback() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let runtime_trait: Arc<dyn SessionRuntime> = runtime.clone();
+        let app = build_router(terminal_enabled_state(
+            runtime_trait,
+            temp.path().join("control.sqlite"),
+        ));
+        let workspace = create_workspace_request(&app, temp.path(), "sandbox").await;
+        let created = create_local_session_request(&app, &workspace.id, "alpha").await;
+
+        runtime
+            .snapshots
+            .lock()
+            .expect("lock")
+            .insert("alpha".to_string(), sample_snapshot_with_scrollback());
+
+        let terminal_req = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions/{}/terminal", created.id))
+            .body(Body::empty())
+            .expect("terminal req");
+        let terminal_resp = app.oneshot(terminal_req).await.expect("terminal resp");
+        assert_eq!(terminal_resp.status(), StatusCode::OK);
+        let surface: TerminalSurfaceState = decode_json(
+            terminal_resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        );
+
+        assert_eq!(surface.snapshot.scrollback.len(), 1);
+        assert_eq!(surface.snapshot.scrollback[0].cells[0].text, "$");
+        assert!(surface.snapshot.plain_text.starts_with("$\n"));
+    }
+
+    #[tokio::test]
+    async fn validate_unknown_terminal_stream_session_is_rejected() {
+        let temp = tempdir().expect("tempdir");
+        let runtime: Arc<dyn SessionRuntime> = Arc::new(MockRuntime::default());
+        let app = build_router(terminal_enabled_state(runtime, temp.path().join("control.sqlite")));
+        let (addr, server_handle) = spawn_server(app).await;
+
+        let ws_url = format!("ws://{addr}/sessions/missing/terminal/stream");
+        let error = connect_async(ws_url).await.expect_err("missing stream should fail");
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+            other => panic!("unexpected websocket error: {other:?}"),
+        }
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_stream_sequences_are_monotonic() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let runtime_trait: Arc<dyn SessionRuntime> = runtime.clone();
+        let app = build_router(terminal_enabled_state(
+            runtime_trait,
+            temp.path().join("control.sqlite"),
+        ));
+        let workspace = create_workspace_request(&app, temp.path(), "sandbox").await;
+        let created = create_local_session_request(&app, &workspace.id, "alpha").await;
+        let (addr, server_handle) = spawn_server(app).await;
+
+        let ws_url = format!("ws://{addr}/sessions/{}/terminal/stream", created.id);
+        let (mut ws, _) = connect_async(ws_url).await.expect("connect terminal ws");
+
+        let initial = read_terminal_frame(&mut ws).await;
+        assert_eq!(initial.sequence, 1);
+        assert_eq!(initial.session_id, created.id);
+
+        runtime
+            .snapshots
+            .lock()
+            .expect("lock")
+            .insert("alpha".to_string(), snapshot_with_text("cde", "uvw"));
+        let second = read_terminal_frame(&mut ws).await;
+        assert_eq!(second.sequence, 2);
+
+        runtime
+            .snapshots
+            .lock()
+            .expect("lock")
+            .insert("alpha".to_string(), snapshot_with_text("xyz", "uvw"));
+        let third = read_terminal_frame(&mut ws).await;
+        assert_eq!(third.sequence, 3);
+        assert!(third.sequence > second.sequence);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_stream_backpressure_coalesces_to_latest_snapshot() {
+        let initial = sample_snapshot();
+        let newer = snapshot_with_text("cde", "uvw");
+        let latest = snapshot_with_text("xyz", "uvw");
+        let (updates_tx, mut updates_rx) = watch::channel(TerminalStreamUpdate::Snapshot(initial.clone()));
+
+        updates_tx
+            .send(TerminalStreamUpdate::Snapshot(newer))
+            .expect("send newer");
+        updates_tx
+            .send(TerminalStreamUpdate::Snapshot(latest.clone()))
+            .expect("send latest");
+
+        updates_rx.changed().await.expect("watch changed");
+        let update = updates_rx.borrow().clone();
+        let snapshot = match update {
+            TerminalStreamUpdate::Snapshot(snapshot) => snapshot,
+            TerminalStreamUpdate::Closed => panic!("stream unexpectedly closed"),
+        };
+        let frame = snapshot.diff_frame("session-1", 2, Some(&initial));
+
+        assert_eq!(frame.sequence, 2);
+        assert_eq!(frame.lines[0].cells[0].text, "x");
+        assert_eq!(frame.lines[0].cells[1].text, "y");
+        assert_eq!(frame.lines[0].cells[2].text, "z");
+    }
+
+    #[tokio::test]
+    async fn validate_terminal_stream_closes_when_selected_session_terminates() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let runtime_trait: Arc<dyn SessionRuntime> = runtime.clone();
+        let app = build_router(terminal_enabled_state(
+            runtime_trait,
+            temp.path().join("control.sqlite"),
+        ));
+        let workspace = create_workspace_request(&app, temp.path(), "sandbox").await;
+        let created = create_local_session_request(&app, &workspace.id, "alpha").await;
+        let (addr, server_handle) = spawn_server(app).await;
+
+        let ws_url = format!("ws://{addr}/sessions/{}/terminal/stream", created.id);
+        let (mut ws, _) = connect_async(ws_url).await.expect("connect terminal ws");
+        let _ = read_terminal_frame(&mut ws).await;
+
+        let client = Client::new();
+        let status = client
+            .delete(format!("http://{addr}/sessions/{}", created.id))
+            .send()
+            .await
+            .expect("terminate")
+            .status();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("terminal close frame")
+            .expect("close message")
+            .expect("websocket result");
+        assert!(matches!(closed, tokio_tungstenite::tungstenite::Message::Close(_)));
+
+        server_handle.abort();
+    }
+
+    async fn read_terminal_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ) -> TerminalStreamFrame {
+        let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("terminal frame")
+            .expect("frame next")
+            .expect("frame result")
+            .into_text()
+            .expect("frame text");
+        serde_json::from_str(&message).expect("terminal frame json")
     }
 }
