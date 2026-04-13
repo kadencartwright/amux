@@ -5,5 +5,8 @@
   "scripts": {
     "build": "./scripts/build.sh",
     "test": "node --test ./test/core.test.mjs"
+  },
+  "dependencies": {
+    "ghostty-web": "^0.4.0"
   }
 }

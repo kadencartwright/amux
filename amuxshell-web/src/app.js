@@ -1,17 +1,13 @@
-import initRendererModule, {
-  WasmCanvasRenderer
-} from "./vendor/amuxterm_web.js";
+import { FitAddon, Terminal, init as initGhostty } from "./vendor/ghostty-web.js";
 import {
   acknowledgeInputFocus,
-  applyTerminalStreamFrame,
   applySessions,
   applyWorkspaceResources,
   applyWorkspaces,
-  buildNamedKeyRequest,
-  buildTextInputRequest,
   clearCtrlModifier,
   clearNotice,
   createShellState,
+  detectMobileBrowser,
   eventRequiresSessionRefresh,
   handleCreateSuccess,
   parseShellRoute,
@@ -19,7 +15,6 @@ import {
   selectSession,
   selectWorkspace,
   sessionRoute,
-  setInputDraft,
   setMobileNavOpen,
   setNotice,
   setPageVisibility,
@@ -36,9 +31,16 @@ import {
 
 const root = document.querySelector("#shell-root");
 
-let state = createShellState(window.location.pathname, document.visibilityState);
-let renderer = null;
-let rendererCanvas = null;
+let state = createShellState(
+  window.location.pathname,
+  document.visibilityState,
+  detectMobileBrowser(window.navigator.userAgent)
+);
+let terminal = null;
+let terminalHost = null;
+let fitAddon = null;
+let terminalBootstrapFingerprint = null;
+const textEncoder = new TextEncoder();
 let socket = null;
 let reconnectTimer = null;
 let terminalSocket = null;
@@ -49,6 +51,8 @@ let terminalStreamReady = false;
 let terminalBufferedFrames = [];
 let terminalFrameQueue = Promise.resolve();
 let terminalRequestId = 0;
+let terminalReconnectFailures = 0;
+let terminalLastOpenedAt = 0;
 
 root.addEventListener("click", (event) => {
   void runAction(() => handleClick(event));
@@ -57,10 +61,12 @@ root.addEventListener("submit", (event) => {
   void runAction(() => handleSubmit(event));
 });
 root.addEventListener("input", handleInput);
+root.addEventListener("keydown", handleKeyDown);
 window.addEventListener("popstate", () => {
   void runAction(handlePopState);
 });
 window.addEventListener("resize", handleResize);
+window.addEventListener("keydown", handleDesktopKeyDown);
 document.addEventListener("visibilitychange", () => {
   void runAction(handleVisibilityChange);
 });
@@ -79,9 +85,7 @@ boot().catch((error) => {
 
 async function boot() {
   render();
-  await initRendererModule(
-    new URL("./vendor/amuxterm_web_bg.wasm", import.meta.url)
-  );
+  await initGhostty();
   await refetchWorkspaces();
   await refetchSessions({ replaceHistory: true });
   connectSocket(false);
@@ -111,31 +115,54 @@ function render() {
 }
 
 function paintTerminal() {
-  const canvas = root.querySelector("#terminal-canvas");
-  if (!canvas || !state.terminalSurface || state.terminalUnavailable) {
-    renderer = null;
-    rendererCanvas = null;
+  const host = root.querySelector("#terminal-canvas");
+  if (!host || !state.terminalSurface || state.terminalUnavailable) {
+    terminal = null;
+    terminalHost = null;
+    fitAddon = null;
+    terminalBootstrapFingerprint = null;
     return;
   }
 
-  if (!renderer || rendererCanvas !== canvas) {
-    renderer = new WasmCanvasRenderer(canvas);
-    rendererCanvas = canvas;
+  if (!terminal || terminalHost !== host) {
+    terminalHost = host;
+    terminal = new Terminal({
+      fontFamily: "IBM Plex Mono, monospace",
+      fontSize: 14,
+      cursorBlink: true,
+      scrollback: 0,
+      theme: {
+        background: "#061018",
+        foreground: "#e5edf0"
+      }
+    });
+    fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(host);
+    fitAddon.fit();
+    terminal.onData((data) => {
+      sendTerminalBytes(textEncoder.encode(data));
+    });
+    terminalBootstrapFingerprint = null;
   }
 
-  const rect = canvas.getBoundingClientRect();
-  const width = rect.width || canvas.clientWidth || 720;
-  const height = rect.height || canvas.clientHeight || 480;
-  const orientation =
-    window.innerWidth >= window.innerHeight ? "landscape" : "portrait";
+  const fingerprint = `${state.selectedSessionId || ""}:${state.terminalSurface.snapshot?.plain_text || ""}`;
+  if (terminalBootstrapFingerprint !== fingerprint) {
+    terminal.reset();
+    terminal.write(visibleSnapshotText(state.terminalSurface));
+    terminalBootstrapFingerprint = fingerprint;
+  }
+  fitAddon?.fit();
+  terminal.focus();
+}
 
-  renderer.handle_viewport_change(
-    width,
-    height,
-    window.devicePixelRatio || 1,
-    orientation
-  );
-  renderer.render_surface_json(JSON.stringify(state.terminalSurface));
+function visibleSnapshotText(surface) {
+  if (!surface?.snapshot?.lines) {
+    return surface?.snapshot?.plain_text || "";
+  }
+  return surface.snapshot.lines
+    .map((line) => (line.cells || []).map((cell) => cell.text || "").join(""))
+    .join("\n");
 }
 
 async function handleClick(event) {
@@ -206,16 +233,14 @@ async function handleClick(event) {
   }
 
   if (button.dataset.terminalKey) {
-    if (!state.selectedSessionId) {
+    if (!state.selectedSessionId || !terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) {
       return;
     }
-    const payload = buildNamedKeyRequest(
-      button.dataset.terminalKey,
-      state.ctrlModifierLatched
-    );
+
+    sendTerminalNamedKey(button.dataset.terminalKey, state.ctrlModifierLatched);
     state = clearCtrlModifier(state);
     render();
-    await submitTerminalInput(payload);
+    return;
   }
 }
 
@@ -293,32 +318,87 @@ async function handleSubmit(event) {
     return;
   }
 
-  if (form.id === "terminal-input-form") {
-    if (!state.selectedSessionId) {
-      return;
-    }
-
-    const payload = buildTextInputRequest(
-      state.inputDraft,
-      state.ctrlModifierLatched,
-      { appendEnter: true }
-    );
-    if (!payload.events.length) {
-      return;
-    }
-
-    state = clearCtrlModifier(setInputDraft(state, ""));
-    render();
-    await submitTerminalInput(payload);
-  }
 }
 
 function handleInput(event) {
-  if (event.target.id !== "terminal-input") {
+  if (event.target.id !== "terminal-mobile-input") {
     return;
   }
 
-  state = setInputDraft(state, event.target.value);
+  const value = event.target.value;
+  if (!value) {
+    return;
+  }
+
+  sendTextInput(value, state.ctrlModifierLatched);
+  state = clearCtrlModifier(state);
+  event.target.value = "";
+  render();
+}
+
+function handleKeyDown(event) {
+  if (event.target.id !== "terminal-mobile-input") {
+    return;
+  }
+
+  if (event.key === "Enter") {
+    event.preventDefault();
+    sendTerminalNamedKey("enter", state.ctrlModifierLatched);
+    state = clearCtrlModifier(state);
+    event.target.value = "";
+    render();
+  }
+}
+
+function handleDesktopKeyDown(event) {
+  if (state.isMobileBrowser) {
+    return;
+  }
+  if (!state.selectedSessionId || !terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  if (isEditableTarget(event.target)) {
+    return;
+  }
+
+  const key = event.key;
+  if (event.ctrlKey && !event.metaKey && !event.altKey && key.length === 1) {
+    const upper = key.toUpperCase();
+    const code = upper.charCodeAt(0);
+    if (code >= 0x40 && code <= 0x5f) {
+      event.preventDefault();
+      sendTerminalBytes(Uint8Array.from([code & 0x1f]));
+      return;
+    }
+  }
+
+  const special = {
+    Enter: "\r",
+    Tab: "\t",
+    Escape: "\u001b",
+    ArrowUp: "\u001b[A",
+    ArrowDown: "\u001b[B",
+    ArrowRight: "\u001b[C",
+    ArrowLeft: "\u001b[D",
+    Backspace: "\u007f"
+  };
+  if (special[key]) {
+    event.preventDefault();
+    sendTerminalBytes(textEncoder.encode(special[key]));
+  }
+}
+
+function isEditableTarget(target) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tag = target.tagName;
+  return (
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT" ||
+    target.isContentEditable
+  );
 }
 
 async function handlePopState() {
@@ -341,7 +421,8 @@ async function handlePopState() {
 }
 
 function handleResize() {
-  paintTerminal();
+  fitAddon?.fit();
+  sendResizeControl();
 }
 
 async function handleVisibilityChange() {
@@ -433,8 +514,62 @@ async function refreshTerminalSnapshot(sessionId, forceRender) {
   }
 }
 
-async function submitTerminalInput(payload) {
-  await apiPost(`/sessions/${state.selectedSessionId}/terminal/input`, payload);
+function sendTerminalBytes(bytes) {
+  if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  terminalSocket.send(bytes);
+}
+
+function sendTextInput(value, ctrlModifierLatched) {
+  if (!value) {
+    return;
+  }
+
+  if (ctrlModifierLatched && [...value].length === 1) {
+    const ch = value.charCodeAt(0);
+    if (ch >= 0x40 && ch <= 0x7f) {
+      sendTerminalBytes(Uint8Array.from([ch & 0x1f]));
+      return;
+    }
+  }
+
+  sendTerminalBytes(textEncoder.encode(value));
+}
+
+function sendTerminalNamedKey(namedKey, ctrlModifierLatched) {
+  const value = mapNamedKeyToBytes(namedKey, ctrlModifierLatched);
+  if (!value) {
+    return;
+  }
+  sendTerminalBytes(textEncoder.encode(value));
+}
+
+function mapNamedKeyToBytes(namedKey, ctrlModifierLatched) {
+  const mapped = {
+    escape: "\u001b",
+    tab: "\t",
+    enter: "\r",
+    arrow_up: ctrlModifierLatched ? "\u001b[1;5A" : "\u001b[A",
+    arrow_down: ctrlModifierLatched ? "\u001b[1;5B" : "\u001b[B",
+    arrow_right: ctrlModifierLatched ? "\u001b[1;5C" : "\u001b[C",
+    arrow_left: ctrlModifierLatched ? "\u001b[1;5D" : "\u001b[D"
+  };
+  return mapped[namedKey] || null;
+}
+
+function sendResizeControl() {
+  if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN || !terminal) {
+    return;
+  }
+
+  terminalSocket.send(
+    JSON.stringify({
+      type: "resize",
+      rows: terminal.rows,
+      cols: terminal.cols
+    })
+  );
 }
 
 async function ensureSelectedTerminalTransport(reconnected, forceRender) {
@@ -492,6 +627,7 @@ function connectTerminalStream(sessionId) {
   const nextSocket = new WebSocket(
     `${protocol}//${window.location.host}/sessions/${encodeURIComponent(sessionId)}/terminal/stream`
   );
+  nextSocket.binaryType = "arraybuffer";
 
   terminalSocket = nextSocket;
   terminalSocketSessionId = sessionId;
@@ -505,6 +641,9 @@ function connectTerminalStream(sessionId) {
 
     state = setTerminalStreamStatus(state, "connected");
     terminalStreamReady = true;
+    terminalLastOpenedAt = Date.now();
+    terminalReconnectFailures = 0;
+    sendResizeControl();
     render();
 
     const bufferedFrames = terminalBufferedFrames.splice(0);
@@ -514,7 +653,7 @@ function connectTerminalStream(sessionId) {
   });
 
   nextSocket.addEventListener("message", (message) => {
-    if (terminalSocket !== nextSocket || typeof message.data !== "string") {
+    if (terminalSocket !== nextSocket) {
       return;
     }
 
@@ -550,6 +689,22 @@ function connectTerminalStream(sessionId) {
     void runAction(async () => {
       await refetchSessions({ replaceHistory: true });
       if (state.selectedSessionId === sessionId && shouldConnectTerminalStream(state)) {
+        const livedMs = terminalLastOpenedAt ? Date.now() - terminalLastOpenedAt : 0;
+        if (livedMs > 0 && livedMs < 1500) {
+          terminalReconnectFailures += 1;
+        } else {
+          terminalReconnectFailures = 1;
+        }
+        if (terminalReconnectFailures >= 3) {
+          state = setTerminalStreamStatus(state, "disconnected");
+          state = setNotice(
+            state,
+            "Terminal stream keeps closing immediately. Check daemon logs and refresh after restart.",
+            "warning"
+          );
+          render();
+          return;
+        }
         state = setTerminalStreamStatus(state, "reconnecting");
         render();
         scheduleTerminalReconnect();
@@ -569,30 +724,22 @@ function connectTerminalStream(sessionId) {
   });
 }
 
-function queueTerminalPayload(nextSocket, sessionId, payloadText) {
+function queueTerminalPayload(nextSocket, sessionId, payload) {
   terminalFrameQueue = terminalFrameQueue
     .catch(() => undefined)
-    .then(() => runAction(() => handleTerminalStreamPayload(nextSocket, sessionId, payloadText)));
+    .then(() => runAction(() => handleTerminalStreamPayload(nextSocket, sessionId, payload)));
 }
 
-async function handleTerminalStreamPayload(nextSocket, sessionId, payloadText) {
+async function handleTerminalStreamPayload(nextSocket, sessionId, payload) {
   if (terminalSocket !== nextSocket || state.selectedSessionId !== sessionId) {
     return;
   }
 
-  const payload = JSON.parse(payloadText);
-  if (payload.session_id !== sessionId) {
+  if (!(payload instanceof ArrayBuffer)) {
     return;
   }
 
-  const result = applyTerminalStreamFrame(state, payload);
-  if (result.needsResync) {
-    await ensureSelectedTerminalTransport(true, true);
-    return;
-  }
-
-  state = result.state;
-  paintTerminal();
+  terminal?.write(new Uint8Array(payload));
 }
 
 function disconnectTerminalStream({ preserveStatus = false } = {}) {
@@ -604,6 +751,7 @@ function disconnectTerminalStream({ preserveStatus = false } = {}) {
   terminalStreamReady = false;
   terminalBufferedFrames = [];
   terminalSocketSessionId = null;
+  terminalLastOpenedAt = 0;
 
   if (terminalSocket) {
     const activeSocket = terminalSocket;

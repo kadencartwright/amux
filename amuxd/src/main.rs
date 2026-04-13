@@ -20,6 +20,9 @@ async fn main() {
         terminal_renderer_v1_enabled: env::var("AMUXD_TERMINAL_RENDERER_V1")
             .ok()
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True")),
+        terminal_http_input_migration_enabled: env::var("AMUXD_TERMINAL_HTTP_INPUT_MIGRATION")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True")),
     };
 
     let state =

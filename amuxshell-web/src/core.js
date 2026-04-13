@@ -32,7 +32,11 @@ export function sessionRoute(sessionId) {
   return `/app/sessions/${encodeURIComponent(sessionId)}`;
 }
 
-export function createShellState(pathname, visibilityState = "visible") {
+export function createShellState(
+  pathname,
+  visibilityState = "visible",
+  isMobileBrowser = false
+) {
   return {
     route: parseShellRoute(pathname),
     sessions: [],
@@ -50,10 +54,16 @@ export function createShellState(pathname, visibilityState = "visible") {
     mobileNavOpen: false,
     socketStatus: "connecting",
     focusTerminalInput: false,
+    isMobileBrowser,
     ctrlModifierLatched: false,
     inputDraft: "",
     notice: null
   };
+}
+
+export function detectMobileBrowser(userAgent = "") {
+  const normalized = String(userAgent).toLowerCase();
+  return /iphone|ipad|ipod|android/.test(normalized);
 }
 
 export function applyWorkspaces(state, workspaces) {
@@ -596,7 +606,7 @@ function renderTerminalPane(state, selectedSession) {
          <p>The daemon session controls are still live, but terminal routes are disabled or unavailable for this session.</p>
        </div>`
     : `<div class="terminal-frame">
-         <canvas id="terminal-canvas" class="terminal-frame__canvas" aria-label="Terminal surface"></canvas>
+         <div id="terminal-canvas" class="terminal-frame__canvas" aria-label="Terminal surface"></div>
        </div>`;
 
   const terminalMeta = terminalStreamLabel(state.terminalStreamStatus);
@@ -604,20 +614,25 @@ function renderTerminalPane(state, selectedSession) {
   const inputControls = state.terminalUnavailable
     ? ""
     : `
-      <form id="terminal-input-form" class="terminal-input">
-        <label for="terminal-input">Terminal input</label>
-        <textarea
-          id="terminal-input"
-          rows="3"
-          placeholder="Type text for the selected session"
-        >${escapeHtml(state.inputDraft)}</textarea>
-        <div class="terminal-input__actions">
-          <button type="submit">Send + Enter</button>
-          <span class="terminal-input__hint">The submit button sends the text and presses Enter while the selected-session stream stays read-only.</span>
+      <div class="terminal-input terminal-input--mobile ${
+        state.isMobileBrowser ? "" : "terminal-input--hidden"
+      }" data-testid="mobile-input-area">
+        <div class="terminal-modifiers" data-testid="mobile-modifiers">
+          ${MOBILE_MODIFIER_CONTROLS.map((control) => renderModifierButton(control, state.ctrlModifierLatched)).join("")}
         </div>
-      </form>
-      <div class="terminal-modifiers" data-testid="mobile-modifiers">
-        ${MOBILE_MODIFIER_CONTROLS.map((control) => renderModifierButton(control, state.ctrlModifierLatched)).join("")}
+        <label class="terminal-input__label" for="terminal-mobile-input">Tap to type</label>
+        <input
+          id="terminal-mobile-input"
+          class="terminal-input__mobile"
+          type="text"
+          autocapitalize="off"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          inputmode="text"
+          placeholder=""
+          value=""
+        />
       </div>
     `;
 

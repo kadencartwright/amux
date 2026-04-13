@@ -1,6 +1,6 @@
 # Terminal Browser Matrix
 
-This document is the baseline validation plan for `terminal-renderer-v1-baseline`.
+This document is the baseline validation plan for the `ghostty-terminal` migration.
 
 ## Priority Order
 
@@ -11,7 +11,7 @@ This document is the baseline validation plan for `terminal-renderer-v1-baseline
 
 ## Fixture Corpus
 
-Use [amuxterm-web/fixtures/browser-fixtures.json](/home/k/code/amux/amuxterm-web/fixtures/browser-fixtures.json) as the minimum ANSI fixture set for every browser run.
+Use a stable ANSI fixture corpus from your terminal integration tests as the minimum fixture set for every browser run.
 
 ## Required Checks
 
@@ -29,7 +29,7 @@ For each browser in priority order:
 
 - Reliability harness: [amuxd/scripts/terminal_reliability_5000_keys.sh](/home/k/code/amux/amuxd/scripts/terminal_reliability_5000_keys.sh)
 - Latency harness: [amuxd/scripts/measure_terminal_latency.sh](/home/k/code/amux/amuxd/scripts/measure_terminal_latency.sh)
-- Renderer benchmark: [amuxterm-web/scripts/benchmark_renderer.sh](/home/k/code/amux/amuxterm-web/scripts/benchmark_renderer.sh)
+- Renderer benchmark: run the `ghostty-web` demo benchmark against the same fixture corpus used above.
 
 ## Interoperability Notes
 

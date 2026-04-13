@@ -181,7 +181,7 @@ textarea {
 
 .session-create-form input,
 .session-create-form select,
-.terminal-input textarea {
+.terminal-input input {
   width: 100%;
   padding: 0.85rem 1rem;
   border-radius: 1rem;
@@ -343,9 +343,17 @@ textarea {
   gap: 0.75rem;
 }
 
-.terminal-input textarea {
-  min-height: 6rem;
+.terminal-input__label {
+  color: var(--shell-text-muted);
+}
+
+.terminal-input__mobile {
+  min-height: 2.8rem;
   font-family: var(--shell-mono);
+}
+
+.terminal-input--hidden {
+  display: none;
 }
 
 .terminal-input__actions {
